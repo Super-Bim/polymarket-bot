@@ -50,5 +50,18 @@ The bot will instantly download the old Binance candles to avoid waiting too lon
 
 **Attention:** Due to the L2 Gnosis Safe infrastructure and the Gasless necessity of the Safe itself (Proxy Wallet), the bot executes an aggressive commercial tactic and **validates profits**, however **Redeeming Matured Positions** must be periodically done manually directly in the "Portfolio / Redeem Positions" tab on your official Polymarket website dashboard so that the Balance returns safely as available USDC. The bot never burns your tickets without your manual order on the exchange.
 
+
+---
+
+**Want to become one of our sponsors?**
+
+There are two ways to help us:
+**1. Share our project with others.**
+**2. You can send us a tip via Polygon network to our wallet:** 0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4
+
+**Join our Discord group for questions, suggestions, or to chat directly with us.**
+
+https://discord.gg/zwqqvNEm4u
+
 ---
 *Keep your terminal free from power suspension so that the WebSocket oracle does not suffer from latency! Good profits!* 💸
