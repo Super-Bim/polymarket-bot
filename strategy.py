@@ -10,6 +10,7 @@ from typing import Optional, Dict
 from config import (
     ENTRY_PRICE_THRESHOLD,
     GALE_1_PRICE_THRESHOLD,
+    GALE_2_PLUS_PRICE_THRESHOLD,
     ENTRY_WINDOW_SECONDS,
     MARTINGALE_WINDOW_SECONDS,
     MARTINGALE_MULTIPLIER,
@@ -209,55 +210,40 @@ class Strategy:
                 trade = self.trade_1 if is_trade_1 else (self.gales[-1] if self.gales else None)
                 
                 if trade:
-                    self.log.info("Waiting for official Polymarket oracle to resolve market (May take up to 10s)...")
-                    self._set_state(State.VERIFYING_RESULT)
-                    threading.Thread(target=self._verify_and_resolve, args=(trade, candle, is_trade_1), daemon=True).start()
+                    # Determining WIN/LOSS instantly based on Binance chart
+                    is_outcome_win = (candle.direction == self.target_side)
+                    
+                    if is_outcome_win:
+                        self.log.win_signal(trade, candle)
+                        self.poly.register_win_for_fee_capture(trade)
+                        self._set_state(State.IDLE)
+                        self._reset_context()
+                    else:
+                        # Loss logic
+                        if is_trade_1:
+                            self.log.loss_signal(f"Initial trade lost. Starting Gale 1...")
+                            self.martingale_start = time.time()
+                            self._set_state(State.MARTINGALE_WAIT)
+                        else:
+                            if self.gale_count >= MAX_GALES:
+                                self.log.loss_signal(
+                                    f"Gale {self.gale_count} reached MAX LIMIT ({MAX_GALES}). "
+                                    "Ending sequence assuming loss."
+                                )
+                                self._set_state(State.IDLE)
+                                self._reset_context()
+                            else:
+                                self.log.loss_signal(
+                                    f"Gale {self.gale_count} lost. "
+                                    f"Waiting for Gale {self.gale_count + 1} opportunity..."
+                                )
+                                self.martingale_start = time.time()
+                                self._set_state(State.MARTINGALE_WAIT)
 
             # ALWAYS update tokens on closing — each 5min cycle has new IDs
             self._refresh_tokens_if_needed(force=True)
 
-    def _verify_and_resolve(self, trade, candle, is_trade_1: bool):
-        """
-        Async thread to verify actual blockchain victory.
-        If exceeds 10s without response, assumes fallback to focus on robot sequence.
-        """
-        # Await Gamma API resolution attempt
-        is_win = self.poly.check_is_winner(trade.token_id, timeout_seconds=10)
-        
-        with self._lock:
-            if is_win is None:
-                self.log.warn("Polymarket did not resolve in 10s. Using Binance candlestick as FALLBACK.")
-                is_win_final = (candle.direction == self.target_side)
-            else:
-                is_win_final = is_win
 
-            if is_win_final:
-                # Determined WIN
-                self.log.win_signal(trade, candle)
-                self.poly.register_win_for_fee_capture(trade)
-                self._set_state(State.IDLE)
-                self._reset_context()
-            else:
-                # Loss
-                if is_trade_1:
-                    self.log.loss_signal(f"Initial trade lost. Starting Gale 1...")
-                    self.martingale_start = time.time()
-                    self._set_state(State.MARTINGALE_WAIT)
-                else:
-                    if self.gale_count >= MAX_GALES:
-                        self.log.loss_signal(
-                            f"Gale {self.gale_count} reached MAX LIMIT ({MAX_GALES}). "
-                            "Ending sequence assuming loss."
-                        )
-                        self._set_state(State.IDLE)
-                        self._reset_context()
-                    else:
-                        self.log.loss_signal(
-                            f"Gale {self.gale_count} lost. "
-                            f"Waiting for Gale {self.gale_count + 1} opportunity..."
-                        )
-                        self.martingale_start = time.time()
-                        self._set_state(State.MARTINGALE_WAIT)
 
     # ---------------------------------------------------------------- #
     # Entry Logic                                                        #
@@ -290,10 +276,10 @@ class Strategy:
         )
 
         is_market_gale = self.gale_count >= 1  # Gale 2 onwards
-        threshold = GALE_1_PRICE_THRESHOLD if self.gale_count == 0 else 1.0
+        threshold = GALE_1_PRICE_THRESHOLD if self.gale_count == 0 else GALE_2_PLUS_PRICE_THRESHOLD
 
-        # If Gale 2+, enter at market regardless of ENTRY_PRICE_THRESHOLD
-        if (price <= threshold or is_market_gale) and price > 0:
+        # Gale entry logic
+        if price <= threshold and price > 0:
             prev_size = self.gales[-1].size_usdc if self.gales else self.trade_1.size_usdc
             size      = self._calc_gale_size(prev_size)
             success   = self._place_buy(
