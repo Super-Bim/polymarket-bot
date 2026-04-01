@@ -49,7 +49,14 @@ The bot will instantly download the old Binance candles to avoid waiting too lon
 ## 📈 Profit Claim (Cash Out / Redeem)
 
 **Attention:** Due to the L2 Gnosis Safe infrastructure and the Gasless necessity of the Safe itself (Proxy Wallet), the bot executes an aggressive commercial tactic and **validates profits**, however **Redeeming Matured Positions** must be periodically done manually directly in the "Portfolio / Redeem Positions" tab on your official Polymarket website dashboard so that the Balance returns safely as available USDC. The bot never burns your tickets without your manual order on the exchange.
+---
 
+**Attention if you use a master wallet with a direct connection:**
+We suggest creating a separate wallet for running the bot, as you will need to use the private key of that wallet.
+
+With this type of direct connection, you need to have a balance in USD Coin (PoS) = USDC.e and a balance in Polygon to pay for network gas.
+
+Modify the config.py file to suit your strategy.
 
 ---
 
