@@ -83,7 +83,7 @@ class Strategy:
     def __init__(self, poly_client, logger):
         self.poly  = poly_client
         self.log   = logger
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # State
         self._state: State = State.IDLE
@@ -110,6 +110,7 @@ class Strategy:
         # Price polling
         self._last_price_check: float = 0
         self.total_spent: float = 0.0
+        self._prefetch_triggered: bool = False
 
     # ---------------------------------------------------------------- #
     # Public state property                                              #
@@ -133,11 +134,12 @@ class Strategy:
         Called when N consecutive candles in same direction are detected.
         Only starts new scan if IDLE.
         """
+        # --- MOVED OUTSIDE LOCK: Network-bound call ---
+        self._refresh_tokens_if_needed()
+
         with self._lock:
             if self._state != State.IDLE:
                 return
-
-            self._refresh_tokens_if_needed()
 
             opposite = "DOWN" if direction == "UP" else "UP"
             token_id  = self.token_ids.get(opposite)
@@ -156,6 +158,10 @@ class Strategy:
             self._set_state(State.SCANNING)
             self.log.sequence_detected(direction, candles)
 
+            # --- IMMEDATE ACTION: To reduce 2s delay ---
+            # Instead of waiting for next tick, attempt entry NOW
+            self._try_first_entry(0.0)
+
     def on_candle_tick(self, candle):
         """
         Called on each tick of the current candle.
@@ -171,6 +177,13 @@ class Strategy:
 
             # Heartbeat to keep session alive
             self._heartbeat_id = self.poly.send_heartbeat(self._heartbeat_id)
+
+            # --- TOKEN PRE-FETCH (15s before close) ---
+            # To avoid 1s latency on Gamma API call during close
+            rem = candle.remaining_seconds
+            if rem < 15 and not self._prefetch_triggered:
+                self._prefetch_triggered = True
+                threading.Thread(target=self._refresh_tokens_if_needed, kwargs={"force": True}, daemon=True).start()
 
             if self._state == State.SCANNING:
                 elapsed = now - self.sequence_time
@@ -243,8 +256,15 @@ class Strategy:
                                 self.martingale_start = time.time()
                                 self._set_state(State.MARTINGALE_WAIT)
 
-            # ALWAYS update tokens on closing — each 5min cycle has new IDs
-            self._refresh_tokens_if_needed(force=True)
+            # If we transitioned to WAIT, try Gale immediately
+            if self._state == State.MARTINGALE_WAIT:
+                self._try_gale(0.0)
+
+        # --- MOVED OUTSIDE LOCK: Network-bound call ---
+        # ALWAYS update tokens on closing — each 5min cycle has new IDs
+        self._refresh_tokens_if_needed(force=True)
+        # Reset pre-fetch for next candle
+        self._prefetch_triggered = False
 
 
 
@@ -355,8 +375,9 @@ class Strategy:
         if force or (now - self._last_token_refresh > MARKET_REFRESH_INTERVAL):
             new_ids = self.poly.fetch_market_tokens()
             if new_ids:
-                self.token_ids = new_ids
-                self._last_token_refresh = now
+                with self._lock:
+                    self.token_ids = new_ids
+                    self._last_token_refresh = now
                 self.log.info(
                     f"Tokens refreshed — "
                     f"UP: {new_ids.get('UP', 'N/A')[:12]}...  "

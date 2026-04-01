@@ -78,6 +78,10 @@ class BinanceStream:
 
             candle = Candle(data["k"])
 
+            # Optional: Periodic Pulse (each 10 messages)
+            # if getattr(self, '_msg_count', 0) % 20 == 0:
+            #     pass 
+
             if candle.closed:
                 self._closed_candles.append(candle)
                 # Keep only the last SEQUENCE_LENGTH + 2 candles
