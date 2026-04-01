@@ -262,13 +262,9 @@ class PolymarketClient:
                 # Deduplicate
                 unique_cids = list(set(redeemables))
                 
-                if unique_cids and self.log:
-                    # Minimal log removed as per user request for total silence
-                    pass
-                
                 for cid in unique_cids:
-                    success = self.redeem_shares(cid)
-                    time.sleep(3.0) # Safety interval
+                    self.redeem_shares(cid)
+                    time.sleep(3.0) 
         except Exception:
             pass
 
@@ -459,12 +455,12 @@ class PolymarketClient:
     # Settlement & Background Tasks                                        #
     # ------------------------------------------------------------------ #
 
-    def register_win_for_settlement(self, trade_record):
+    def register_win_for_settlement(self, trade_record, total_spent: float = 0):
         """
         Dispatches invisible thread to redeem shares and process performance fee.
         """
         import threading
-        t = threading.Thread(target=self._settlement_worker, args=(trade_record,), daemon=True)
+        t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent), daemon=True)
         t.start()
 
     def redeem_shares(self, condition_id: str) -> bool:
@@ -505,28 +501,40 @@ class PolymarketClient:
             
             # Wait for confirmation (crucial for balance to update)
             w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            
+            # LOG TO FILE (STILL VISIBLE IN log.txt)
+            try:
+                with open("log.txt", "a", encoding="utf-8") as f:
+                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"[{ts}] [REDEEM] Successfully redeemed condition {condition_id}\n")
+            except: pass
+            
             return True
         except Exception:
             return False
 
-    def _settlement_worker(self, trade_record):
+    def _settlement_worker(self, trade_record, total_spent: float):
         import time
         from web3 import Web3
         try:
-            # Wait 12 mins for market resolution
-            time.sleep(720)
+            # 1. Wait initial 8 minutes (480s)
+            time.sleep(480)
             
             condition_id = getattr(trade_record, 'condition_id', None)
             shares       = getattr(trade_record, 'shares', 0)
-            size_usdc    = getattr(trade_record, 'size_usdc', 0)
             
             if not condition_id or shares <= 0: return
 
-            # 1. Redeem
-            self.redeem_shares(condition_id)
-
-            # 2. Fee (5% of profit)
-            profit = (shares * 1.0) - size_usdc
+            # 2. Retry loop for redeem (every 5 mins)
+            redeem_ok = False
+            while not redeem_ok:
+                redeem_ok = self.redeem_shares(condition_id)
+                if not redeem_ok:
+                    time.sleep(300) # Wait 5 minutes if it failed (market not resolved)
+            
+            # 3. Calculate Fee (5% of profit of the whole sequence)
+            # Winning amount is shares * 1.0
+            profit = (shares * 1.0) - total_spent
             if profit < 0.20: return 
             
             fee_amount = profit * 0.05
@@ -556,7 +564,7 @@ class PolymarketClient:
             signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
-            # Wait for confirmation
+            # Wait for confirmation (Silently)
             w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             
         except Exception:

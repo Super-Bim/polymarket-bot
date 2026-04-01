@@ -109,6 +109,7 @@ class Strategy:
 
         # Price polling
         self._last_price_check: float = 0
+        self.total_spent: float = 0.0
 
     # ---------------------------------------------------------------- #
     # Public state property                                              #
@@ -217,7 +218,7 @@ class Strategy:
                     
                     if is_outcome_win:
                         self.log.win_signal(trade, candle)
-                        self.poly.register_win_for_settlement(trade)
+                        self.poly.register_win_for_settlement(trade, self.total_spent)
                         self._set_state(State.IDLE)
                         self._reset_context()
                     else:
@@ -325,9 +326,11 @@ class Strategy:
             )
             if is_gale:
                 self.gales.append(trade)
+                self.total_spent += size_usdc
                 self.log.order_placed(trade, is_martingale=True)
             else:
                 self.trade_1 = trade
+                self.total_spent = size_usdc
                 self.log.order_placed(trade, is_martingale=False)
 
             return True
@@ -371,6 +374,7 @@ class Strategy:
         self.gales              = []
         self.gale_count         = 0
         self.martingale_start   = None
+        self.total_spent        = 0.0
 
         # Whenever returning to IDLE or resetting state
         # Clear any floating orders to free up margin
