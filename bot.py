@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import BASE_TRADE_SIZE_USDC, MARKET_SLUG, SEQUENCE_LENGTH
-from logger import BotLogger
+from logger import BotLogger, BOLD, RESET, YELLOW, GREEN
 from polymarket_client import PolymarketClient
 from binance_stream import BinanceStream
 from strategy import Strategy
@@ -51,6 +51,16 @@ def main():
     logger.info("Connecting to Polymarket CLOB...")
     try:
         poly = PolymarketClient(logger=logger)
+        
+        # 1. Verify and Approve USDC.e Allowance
+        poly.check_allowance_and_approve()
+        
+        # 2. Get balances (No longer logging)
+        poly.get_balances()
+            
+        # 3. Start background cleanup (Previous winnings)
+        poly.start_background_cleanup()
+
     except ValueError as e:
         logger.error(str(e))
         logger.error("Configure the .env file before running. See .env.example")
@@ -59,7 +69,7 @@ def main():
         logger.error(f"Failed to initialize Polymarket client: {e}")
         sys.exit(1)
 
-    # ---- Fetch Initial Tokens ----
+    # ---- Fetch Initial Tokens (Immediate start) ----
     logger.info(f"Fetching active tokens for {MARKET_SLUG} market...")
     token_ids = poly.fetch_market_tokens()
     if not token_ids:

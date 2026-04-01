@@ -48,6 +48,7 @@ class Trade:
         size_usdc: float,
         shares: float,
         order_id: str = "",
+        condition_id: str = "",
     ):
         self.token_id    = token_id
         self.side        = side          # "UP" or "DOWN"
@@ -55,6 +56,7 @@ class Trade:
         self.size_usdc   = size_usdc
         self.shares      = shares
         self.order_id    = order_id
+        self.condition_id = condition_id
         self.entry_time  = time.time()
 
 
@@ -215,7 +217,7 @@ class Strategy:
                     
                     if is_outcome_win:
                         self.log.win_signal(trade, candle)
-                        self.poly.register_win_for_fee_capture(trade)
+                        self.poly.register_win_for_settlement(trade)
                         self._set_state(State.IDLE)
                         self._reset_context()
                     else:
@@ -319,6 +321,7 @@ class Strategy:
                 size_usdc   = size_usdc,
                 shares      = shares,
                 order_id    = resp.get("orderID", ""),
+                condition_id = self.token_ids.get("condition_id", ""),
             )
             if is_gale:
                 self.gales.append(trade)

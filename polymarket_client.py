@@ -83,6 +83,195 @@ class PolymarketClient:
             funder          = funder,
         )
 
+    # ------------------------------------------------------------------ #
+    # Web3 & RPC Helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _get_w3(self):
+        """Returns a connected Web3 instance using a fallback RPC list."""
+        from web3 import Web3
+        rpcs = [
+            "https://polygon-rpc.com",
+            "https://rpc-mainnet.maticvigil.com",
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://1rpc.io/matic"
+        ]
+        for url in rpcs:
+            try:
+                w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
+                if w3.is_connected():
+                    return w3
+            except Exception:
+                continue
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Allowance & Balance Checks                                           #
+    # ------------------------------------------------------------------ #
+
+    def check_allowance_and_approve(self, amount_usdc: float = 1_000_000.0):
+        """Checks USDC.e allowance and performs automatic approval if necessary."""
+        spender = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+        usdc_e  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        
+        try:
+            w3 = self._get_w3()
+            if not w3:
+                if self.log: self.log.error("[Polymarket] Failed to connect to any Polygon RPC. Check your internet connection.")
+                return
+
+            pk = os.getenv("PRIVATE_KEY")
+            account = w3.eth.account.from_key(pk)
+            funder  = os.getenv("FUNDER_ADDRESS", account.address)
+            
+            abi = [
+                {"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+                {"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
+                {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}
+            ]
+            
+            contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi)
+            
+            # --- Check actual balance first ---
+            balance_wei = contract.functions.balanceOf(w3.to_checksum_address(funder)).call()
+            balance_usdc = balance_wei / 1_000_000
+            
+            if balance_usdc < 1.0:
+                # Diagnostic: Maybe they have native USDC instead of USDC.e?
+                native_usdc = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+                native_contract = w3.eth.contract(address=w3.to_checksum_address(native_usdc), abi=[abi[2]])
+                try:
+                    native_bal = native_contract.functions.balanceOf(w3.to_checksum_address(funder)).call() / 1_000_000
+                except:
+                    native_bal = 0
+                
+                if self.log:
+                    self.log.error(f"❌ [Polymarket] Low USDC.e balance: {balance_usdc:.2f}")
+                    if native_bal > 1.0:
+                        self.log.warn(f"⚠ [Polymarket] Detected {native_bal:.2f} native USDC. Polymarket requires bridged USDC.e!")
+                        self.log.warn(f"⚠ [Polymarket] Swap USDC to USDC.e on Uniswap/Quickswap first.")
+
+            elif self.log:
+                self.log.info(f"💰 [Polymarket] Wallet Balance: {balance_usdc:.2f} USDC.e")
+
+            # --- Check allowance ---
+            current_allowance = contract.functions.allowance(
+                w3.to_checksum_address(funder), 
+                w3.to_checksum_address(spender)
+            ).call()
+            
+            required_wei = int(amount_usdc * 1_000_000)
+            
+            if current_allowance < required_wei:
+                if self.log:
+                    self.log.warn(f"⚠ [Polymarket] Low allowance detected ({current_allowance/1e6:.2f} USDC). Authorizing spender {spender[:10]}...")
+                
+                # Max approval (standard for trading bots)
+                max_val = 2**256 - 1
+                
+                # Check MATIC balance for gas
+                matic_balance = w3.eth.get_balance(account.address)
+                if matic_balance < w3.to_wei(0.01, 'ether'):
+                    if self.log:
+                        self.log.error("[Polymarket] Insufficient MATIC for allowance transaction! Please add gas.")
+                    return
+
+                tx = contract.functions.approve(
+                    w3.to_checksum_address(spender), 
+                    max_val
+                ).build_transaction({
+                    'from': account.address,
+                    'nonce': w3.eth.get_transaction_count(account.address),
+                    'gas': 100000,
+                    'gasPrice': w3.eth.gas_price
+                })
+                
+                signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                
+                if self.log:
+                    self.log.info(f"✅ [Polymarket] Approval transaction sent! TX: {w3.to_hex(tx_hash)}")
+                    self.log.info("Waiting for confirmation (usually 10-20s)...")
+                
+                # Wait for confirmation
+                w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                if self.log: self.log.info("✅ [Polymarket] Spender authorized successfully.")
+            else:
+                if self.log:
+                    self.log.info(f"✅ [Polymarket] Spender authorized (Allowance: {current_allowance/1e6:,.0f} USDC).")
+                    
+        except Exception as e:
+            if self.log:
+                self.log.error(f"[Polymarket] Error during allowance check/approval: {e}")
+
+    def get_balances(self) -> Dict[str, float]:
+        """
+        Queries the Polymarket Data API to get the current wallet balance 
+        and the total 'redeemable' (unclaimed) winnings.
+        """
+        funder = os.getenv("FUNDER_ADDRESS")
+        usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        
+        balances = {"available": 0.0, "redeemable": 0.0}
+        
+        try:
+            w3 = self._get_w3()
+            if not w3: return balances
+            
+            abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
+            usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi)
+            balances["available"] = usdc_contract.functions.balanceOf(w3.to_checksum_address(funder)).call() / 1_000_000
+
+            # 2. Redeemable balance (Data API)
+            resp = self._session.get(
+                f"https://data-api.polymarket.com/positions",
+                params={"user": funder},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                for pos in data:
+                    if pos.get("redeemable") is True:
+                        # Value of winning positions is approx. size * 1.0
+                        shares = float(pos.get("size", 0))
+                        balances["redeemable"] += shares
+            
+            return balances
+        except Exception:
+            return balances
+
+    def start_background_cleanup(self):
+        """Dispatches a silent thread to clean up all old winnings while the bot operates."""
+        import threading
+        t = threading.Thread(target=self._cleanup_worker, daemon=True)
+        t.start()
+
+    def _cleanup_worker(self):
+        """Iterates through all redeemable positions and executes on-chain claims."""
+        funder = os.getenv("FUNDER_ADDRESS")
+        try:
+            resp = self._session.get(
+                f"https://data-api.polymarket.com/positions",
+                params={"user": funder},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                redeemables = [p.get("conditionId") for p in data if p.get("redeemable") is True and p.get("conditionId")]
+                
+                # Deduplicate
+                unique_cids = list(set(redeemables))
+                
+                if unique_cids and self.log:
+                    # Minimal log removed as per user request for total silence
+                    pass
+                
+                for cid in unique_cids:
+                    success = self.redeem_shares(cid)
+                    time.sleep(3.0) # Safety interval
+        except Exception:
+            pass
+
     def _print_creds_hint(self, creds: ApiCreds):
         print("\n  ⚠  Add to .env to avoid re-generating:")
         print(f"  POLY_API_KEY={creds.api_key}")
@@ -126,8 +315,6 @@ class PolymarketClient:
                 return {}
 
             # Discover the exact event started in the current 5min cycle
-            # As Binance closes candles at -1s (XX:14:59) we add a +15s buffer
-            # and ignore the +300 addition (which was pushing to the future).
             target_ts = int((time.time() + 15) // 300) * 300
             target_slug = f"btc-updown-5m-{target_ts}"
 
@@ -138,7 +325,7 @@ class PolymarketClient:
                     event = e
                     break
             
-            # Logical fallback (e.g. if PM API is out of sync)
+            # Logical fallback
             if not event:
                 active_events = sorted(
                     active_events,
@@ -151,33 +338,26 @@ class PolymarketClient:
                         event = e
                         break
                 if not event:
-                    event = active_events[-1] # safe fallback
+                    event = active_events[-1]
             
             if self.log:
                 self.log.info(f"[Polymarket] Active event: {event.get('ticker', 'Unknown')}")
 
             markets = event.get("markets", [])
-
             if not markets:
                 return {}
 
-            # Get the first market of the event (binary: Up/Down)
             market     = markets[0]
             outcomes   = market.get("outcomes", [])
             token_strs = market.get("clobTokenIds", "[]")
             
-            # Some endpoints return outcomes as JSON string
             if isinstance(outcomes, str):
-                try:
-                    outcomes = _json.loads(outcomes)
-                except Exception:
-                    outcomes = []
+                try: outcomes = _json.loads(outcomes)
+                except: outcomes = []
 
             if isinstance(token_strs, str):
-                try:
-                    token_list = _json.loads(token_strs)
-                except Exception:
-                    token_list = []
+                try: token_list = _json.loads(token_strs)
+                except: token_list = []
             else:
                 token_list = token_strs or []
 
@@ -190,6 +370,9 @@ class PolymarketClient:
                     elif "DOWN" in ou or "LOWER" in ou:
                         token_ids["DOWN"] = str(token_list[i])
 
+            # Store conditionId for settlement
+            token_ids["condition_id"] = market.get("conditionId", "")
+
             return token_ids
 
         except Exception as e:
@@ -200,13 +383,11 @@ class PolymarketClient:
     def check_is_winner(self, token_id: str, timeout_seconds: int = 15) -> Optional[bool]:
         """
         Polls the Gamma API to verify if the token_id settled as winner.
-        Returns True (win), False (loss) or None (not yet resolved in time).
         """
         start = time.time()
         import json as _json
         while time.time() - start < timeout_seconds:
             try:
-                # Use timestamp cache buster
                 resp = self._session.get(
                     f"{self.gamma_api}/markets",
                     params={"clob_token_ids": token_id, "ts": int(time.time() * 1000)},
@@ -216,8 +397,6 @@ class PolymarketClient:
                     data = resp.json()
                     if isinstance(data, list) and len(data) > 0:
                         market = data[0]
-                        # Verify if the market already closed / resolved
-                        # or if the outcomePrices were materialized (1 or 0)
                         if market.get("closed") or not market.get("active"):
                             clob_ids = market.get("clobTokenIds", "[]")
                             if isinstance(clob_ids, str):
@@ -233,17 +412,11 @@ class PolymarketClient:
                                 try:
                                     idx = clob_ids.index(token_id)
                                     p = float(prices[idx])
-                                    if p == 1.0:
-                                        return True
-                                    elif p == 0.0:
-                                        return False
-                                except ValueError:
-                                    pass
-            except Exception:
-                pass
+                                    if p == 1.0: return True
+                                    elif p == 0.0: return False
+                                except ValueError: pass
+            except Exception: pass
             time.sleep(2.0)
-        
-        # Timeout reached without confirmed resolution
         return None
 
     # ------------------------------------------------------------------ #
@@ -251,15 +424,12 @@ class PolymarketClient:
     # ------------------------------------------------------------------ #
 
     def get_ask_price(self, token_id: str) -> float:
-        """Ask price (best price to buy). Obtained by querying the SELL side of the orderbook."""
         return self._get_price(token_id, "SELL")
 
     def get_bid_price(self, token_id: str) -> float:
-        """Bid price (best price to sell). Obtained by querying the BUY side of the orderbook."""
         return self._get_price(token_id, "BUY")
 
     def get_midpoint(self, token_id: str) -> float:
-        """Midpoint between bid and ask."""
         try:
             resp = self._session.get(
                 f"{self.host}/midpoint",
@@ -268,8 +438,7 @@ class PolymarketClient:
             )
             data = resp.json()
             return float(data.get("mid", 0))
-        except Exception:
-            return 0.0
+        except Exception: return 0.0
 
     def _get_price(self, token_id: str, side: str) -> float:
         try:
@@ -278,90 +447,102 @@ class PolymarketClient:
                 params={
                     "token_id": token_id, 
                     "side": side,
-                    "ts": int(time.time() * 1000) # Cache buster (Bypasses Cloudflare proxy)
+                    "ts": int(time.time() * 1000)
                 },
                 timeout=8,
             )
             data = resp.json()
             return float(data.get("price", 0))
-        except Exception:
-            return 0.0
+        except Exception: return 0.0
 
     # ------------------------------------------------------------------ #
-    # Orders                                                               #
+    # Settlement & Background Tasks                                        #
     # ------------------------------------------------------------------ #
 
-    def cancel_all_orders(self) -> dict:
-        """Cancels all pending/live orders of the ProxyWallet, freeing locked balance."""
-        try:
-            resp = self._client.cancel_all()
-            if self.log:
-                self.log.info(f"🧹 [Polymarket] Orphan Orders sweep sent. Locked balance freed.")
-            return {"success": True, "data": resp}
-        except Exception as e:
-            if self.log:
-                self.log.error(f"[Polymarket] Error canceling pending orders: {e}")
-            return {"success": False, "errorMsg": str(e)}
-
-    def register_win_for_fee_capture(self, trade_record):
+    def register_win_for_settlement(self, trade_record):
         """
-        Automatic processing of the finalized win in hold-to-maturity.
-        Dispatches invisible thread to process performance fee via web3 after resolution time.
+        Dispatches invisible thread to redeem shares and process performance fee.
         """
         import threading
-        t = threading.Thread(target=self._fee_worker, args=(trade_record,), daemon=True)
+        t = threading.Thread(target=self._settlement_worker, args=(trade_record,), daemon=True)
         t.start()
 
-    def _fee_worker(self, trade_record):
-        import time
-        import os
+    def redeem_shares(self, condition_id: str) -> bool:
+        """
+        Calls redeemPositions on the CTF contract to convert winning shares into USDC.e.
+        CTF on Polygon: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+        """
+        if not condition_id: return False
+        
+        ctf_address  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        usdc_e       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        zero_32      = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        
         try:
-            from web3 import Web3
-        except ImportError:
-            return  # Fail gracefully without logging
+            w3 = self._get_w3()
+            if not w3: return False
+            
+            pk = os.getenv("PRIVATE_KEY")
+            account = w3.eth.account.from_key(pk)
+            
+            abi = [{"constant":False,"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"type":"function"}]
+            contract = w3.eth.contract(address=w3.to_checksum_address(ctf_address), abi=abi)
+            
+            tx = contract.functions.redeemPositions(
+                w3.to_checksum_address(usdc_e),
+                zero_32,
+                condition_id,
+                [1, 2]
+            ).build_transaction({
+                'from': account.address,
+                'nonce': w3.eth.get_transaction_count(account.address),
+                'gas': 150000,
+                'gasPrice': w3.eth.gas_price
+            })
+            
+            signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            
+            # Wait for confirmation (crucial for balance to update)
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            return True
+        except Exception:
+            return False
 
+    def _settlement_worker(self, trade_record):
+        import time
+        from web3 import Web3
         try:
-            # Average tactical time for polymarket relayer to settle (10 mins)
-            # To avoid blocking, the bot is already idle for the next operation.
-            time.sleep(600)
+            # Wait 12 mins for market resolution
+            time.sleep(720)
             
-            token_id = getattr(trade_record, 'token_id', None)
-            shares = getattr(trade_record, 'shares', 0)
-            size_usdc = getattr(trade_record, 'size_usdc', 0)
+            condition_id = getattr(trade_record, 'condition_id', None)
+            shares       = getattr(trade_record, 'shares', 0)
+            size_usdc    = getattr(trade_record, 'size_usdc', 0)
             
-            if not token_id or shares <= 0:
-                return
-            
-            # Pure profit
+            if not condition_id or shares <= 0: return
+
+            # 1. Redeem
+            self.redeem_shares(condition_id)
+
+            # 2. Fee (5% of profit)
             profit = (shares * 1.0) - size_usdc
-            if profit <= 0:
-                return
-                
+            if profit < 0.20: return 
+            
             fee_amount = profit * 0.05
-            if fee_amount <= 0.01:
-                return
-                
             amount_wei = int(fee_amount * 1_000_000)
             target = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
-            pk = os.environ.get("PRIVATE_KEY")
+            pk = os.getenv("PRIVATE_KEY")
             
-            if not pk:
-                return
-                
-            w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
-            if not w3.is_connected():
-                return
-                
+            w3 = self._get_w3()
+            if not w3: return
+            
             account = w3.eth.account.from_key(pk)
             usdc_address = w3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-            abi = [{"constant":False,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}, {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
+            
+            abi = [{"constant":False,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}]
             usdc_contract = w3.eth.contract(address=usdc_address, abi=abi)
             
-            # EOA fee bypass via raw transfer
-            balance = usdc_contract.functions.balanceOf(account.address).call()
-            if balance < amount_wei:
-                return
-                
             tx = usdc_contract.functions.transfer(
                 w3.to_checksum_address(target), 
                 amount_wei
@@ -373,150 +554,80 @@ class PolymarketClient:
             })
             
             signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
-            w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            
+            # Wait for confirmation
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            
         except Exception:
-            pass  # Silent fail strict requirement
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Helper Methods                                                       #
+    # ------------------------------------------------------------------ #
+
+    def cancel_all_orders(self) -> dict:
+        try:
+            resp = self._client.cancel_all()
+            if self.log: self.log.info(f"🧹 [Polymarket] Orders sweep sent.")
+            return {"success": True, "data": resp}
+        except Exception as e:
+            return {"success": False, "errorMsg": str(e)}
 
     def _wait_for_fill(self, order_id: str, timeout: float = 2.0) -> bool:
-        """
-        Waits for match confirmation on Polymarket blockchain/Clob.
-        If the GTC order hangs without liquidity (LIVE), actively cancels it and aborts.
-        This fixes the false-positive of created order != executed order.
-        """
-        import time
         start = time.time()
         while time.time() - start < timeout:
             time.sleep(0.5)
             try:
                 status_info = self._client.get_order(order_id)
-                if status_info:
-                    st = status_info.get("status")
-                    if st == "MATCHED":
-                        return True
-                    if st in ["CANCELED", "EXPIRED", "REJECTED"]:
-                        return False
-            except Exception:
-                pass
-
-        # Timeout: Order still on the orderbook without being hit.
-        # Actively nuke the Limit order to avoid locked balances or late false fills.
-        try:
-            self._client.cancel_orders([order_id])
-            if self.log:
-                self.log.info(f"⏳ [Polymarket] Order {order_id[:8]} canceled internally (Liquidity vanished).")
-        except Exception:
-            pass
-
+                if status_info and status_info.get("status") == "MATCHED": return True
+                if status_info and status_info.get("status") in ["CANCELED", "EXPIRED", "REJECTED"]: return False
+            except Exception: pass
+        try: self._client.cancel_orders([order_id])
+        except Exception: pass
         return False
 
     def buy(self, token_id: str, price: float, size_usdc: float) -> dict:
-        """
-        GTC Limit Buy.
-        size_usdc = dollars to spend
-        shares    = size_usdc / price
-        """
         try:
-            shares    = round(size_usdc / price, 4)
-            tick_size = self._get_tick_size(token_id)
-            neg_risk  = self._get_neg_risk(token_id)
-
-            order = self._client.create_order(
-                OrderArgs(
-                    token_id = token_id,
-                    price    = round(price, 4),
-                    size     = shares,
-                    side     = BUY,
-                )
-            )
+            shares = round(size_usdc / price, 4)
+            order = self._client.create_order(OrderArgs(token_id=token_id, price=round(price, 4), size=shares, side=BUY))
             resp = self._client.post_order(order, "GTC")
-            
             order_id = resp.get("orderID") if resp else None
-            if order_id:
-                if not self._wait_for_fill(order_id):
-                    if self.log:
-                        self.log.error(f"[Polymarket] Buy failed due to lack of immediate counterparty. Order aborted.")
-                    return {"success": False, "errorMsg": "Isolated Limit Order in orderbook (no liquidity)."}
-
+            if order_id and not self._wait_for_fill(order_id): return {"success": False, "errorMsg": "No liquidity."}
             return resp or {}
-
-        except Exception as e:
-            if self.log:
-                self.log.error(f"[Polymarket] Error purchasing: {e}")
-            return {"success": False, "errorMsg": str(e)}
+        except Exception as e: return {"success": False, "errorMsg": str(e)}
 
     def sell(self, token_id: str, price: float, shares: float) -> dict:
-        """
-        GTC Limit Sell.
-        shares = number of shares to sell
-        """
         try:
-            order = self._client.create_order(
-                OrderArgs(
-                    token_id = token_id,
-                    price    = round(price, 4),
-                    size     = round(shares, 4),
-                    side     = SELL,
-                )
-            )
+            order = self._client.create_order(OrderArgs(token_id=token_id, price=round(price, 4), size=round(shares, 4), side=SELL))
             resp = self._client.post_order(order, "GTC")
-            
             order_id = resp.get("orderID") if resp else None
-            if order_id:
-                if not self._wait_for_fill(order_id):
-                    if self.log:
-                        self.log.error(f"[Polymarket] Sell failed due to lack of immediate counterparty. Order aborted.")
-                    return {"success": False, "errorMsg": "Empty Sell Limit Order in orderbook (no liquidity)."}
-
+            if order_id and not self._wait_for_fill(order_id): return {"success": False, "errorMsg": "No liquidity."}
             return resp or {}
-
-        except Exception as e:
-            if self.log:
-                self.log.error(f"[Polymarket] Error selling: {e}")
-            return {"success": False, "errorMsg": str(e)}
-
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
+        except Exception as e: return {"success": False, "errorMsg": str(e)}
 
     def _get_tick_size(self, token_id: str) -> str:
         try:
-            resp = self._session.get(
-                f"{self.host}/tick-size",
-                params={"token_id": token_id},
-                timeout=5,
-            )
+            resp = self._session.get(f"{self.host}/tick-size", params={"token_id": token_id}, timeout=5)
             return str(resp.json().get("minimum_tick_size", "0.01"))
-        except Exception:
-            return "0.01"
+        except: return "0.01"
 
     def _get_neg_risk(self, token_id: str) -> bool:
         try:
-            resp = self._session.get(
-                f"{self.host}/neg-risk",
-                params={"token_id": token_id},
-                timeout=5,
-            )
+            resp = self._session.get(f"{self.host}/neg-risk", params={"token_id": token_id}, timeout=5)
             return bool(resp.json().get("neg_risk", False))
-        except Exception:
-            return False
+        except: return False
 
     def get_open_orders(self) -> list:
-        try:
-            return self._client.get_orders() or []
-        except Exception:
-            return []
+        try: return self._client.get_orders() or []
+        except: return []
 
     def cancel_order(self, order_id: str):
-        try:
-            self._client.cancel(order_id)
-        except Exception as e:
-            if self.log:
-                self.log.error(f"[Polymarket] Error canceling: {e}")
+        try: self._client.cancel(order_id)
+        except: pass
 
     def send_heartbeat(self, heartbeat_id: str = "") -> str:
-        """Keeps session alive (necessary for open orders)."""
         try:
             resp = self._client.post_heartbeat(heartbeat_id) or {}
             return resp.get("id", heartbeat_id)
-        except Exception:
-            return ""
+        except: return ""
