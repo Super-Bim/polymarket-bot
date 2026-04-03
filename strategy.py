@@ -153,10 +153,9 @@ class Strategy:
             self.target_side        = opposite
             self.target_token_id    = token_id
             self.trade_1            = None
-            self.trade_2            = None
 
             self._set_state(State.SCANNING)
-            self.log.sequence_detected(direction, candles)
+            self.log.sequence_detected(direction, candles, self.token_ids.get("market_ticker", ""))
 
             # --- IMMEDATE ACTION: To reduce 2s delay ---
             # Instead of waiting for next tick, attempt entry NOW
@@ -276,7 +275,7 @@ class Strategy:
         price = self.poly.get_ask_price(self.target_token_id)
         self.log.price_check(self.target_side, price, elapsed, ENTRY_WINDOW_SECONDS)
 
-        if price <= ENTRY_PRICE_THRESHOLD and price > 0:
+        if price <= ENTRY_PRICE_THRESHOLD and price > 0.02:
             success = self._place_buy(
                 token_id      = self.target_token_id,
                 price         = price,
@@ -302,7 +301,7 @@ class Strategy:
         threshold = GALE_1_PRICE_THRESHOLD if self.gale_count == 0 else GALE_2_PLUS_PRICE_THRESHOLD
 
         # Gale entry logic
-        if price <= threshold and price > 0:
+        if price <= threshold and price > 0.02:
             prev_size = self.gales[-1].size_usdc if self.gales else self.trade_1.size_usdc
             size      = self._calc_gale_size(prev_size)
             success   = self._place_buy(

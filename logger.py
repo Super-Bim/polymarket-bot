@@ -65,19 +65,6 @@ class BotLogger:
             f"Dir:{color}{candle.direction}{RESET}"
         )
 
-    def sequence_detected(self, direction: str, candles):
-        from config import SEQUENCE_LENGTH
-        color = GREEN if direction == "UP" else RED
-        arrow = ("▲" if direction == "UP" else "▼") * SEQUENCE_LENGTH
-        opposite = "DOWN" if direction == "UP" else "UP"
-        print()
-        print(f"{DIM}{LINE}{RESET}")
-        print(
-            f"{_ts()} {color}{BOLD}SEQUENCE DETECTED  {arrow}{RESET}  "
-            f"Trend: {color}{BOLD}{direction}{RESET}  "
-            f"Target: {CYAN}{BOLD}{opposite}{RESET}"
-        )
-        print(f"{DIM}{LINE}{RESET}")
 
     def price_check(self, side: str, price: float, elapsed: float, window: float, is_martingale: bool = False):
         label   = "MARTINGALE" if is_martingale else "ENTRY     "

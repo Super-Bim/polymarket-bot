@@ -8,9 +8,11 @@ import requests
 from typing import Optional, Dict
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs
+from py_clob_client.clob_types import ApiCreds, OrderArgs, MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
+from eth_account import Account
+from dotenv import set_key
 from config import CLOB_HOST, GAMMA_API, CHAIN_ID, MARKET_SLUG, MARKET_SERIES_ID
 
 
@@ -38,49 +40,65 @@ class PolymarketClient:
         })
 
         # Load environment credentials
-        private_key     = os.getenv("PRIVATE_KEY")
-        sig_type        = int(os.getenv("SIGNATURE_TYPE", "2"))
-        funder          = os.getenv("FUNDER_ADDRESS")
+        self.pk         = os.getenv("PRIVATE_KEY")
+        self.sig_type   = int(os.getenv("SIGNATURE_TYPE", "2"))
+        self.funder     = os.getenv("FUNDER_ADDRESS")
         api_key         = os.getenv("POLY_API_KEY", "")
         api_secret      = os.getenv("POLY_API_SECRET", "")
         api_passphrase  = os.getenv("POLY_API_PASSPHRASE", "")
+        self.creds      = None
 
         # Validate essential credentials
-        if not private_key or private_key == "0xSUA_CHAVE_PRIVADA_AQUI":
+        if not self.pk or self.pk in ["0xSUA_CHAVE_PRIVADA_AQUI", "0xYOUR_PRIVATE_KEY_HERE"]:
             raise ValueError("PRIVATE_KEY not configured in .env")
-        if not funder or funder == "0xSEU_PROXY_WALLET_AQUI":
-            raise ValueError("FUNDER_ADDRESS not configured in .env")
+
+        # Derive or validate funder address
+        derived_funder = False
+        # Treat empty string or placeholder as missing
+        if not self.funder or self.funder.strip() in ["", "0xSEU_PROXY_WALLET_AQUI", "0xYOUR_ADDRESS_HERE", "0xSEU_ENDERECO_AQUI"]:
+            if self.sig_type == 0:  # EOA
+                self.funder = Account.from_key(self.pk).address
+                derived_funder = True
+                if self.log:
+                    self.log.info(f"Auto-derived address from PK: {self.funder[:10]}...")
+            else:
+                raise ValueError(f"FUNDER_ADDRESS must be provided for SIGNATURE_TYPE {self.sig_type} (Proxy/Email)")
 
         # Create client without L2 creds first (to generate if necessary)
         self._l1_client = ClobClient(
             host            = self.host,
-            key             = private_key,
+            key             = self.pk,
             chain_id        = CHAIN_ID,
-            signature_type  = sig_type,
-            funder          = funder,
+            signature_type  = self.sig_type,
+            funder          = self.funder,
         )
 
         # Derive or use L2 credentials
+        new_creds_generated = False
         if api_key and api_secret and api_passphrase:
-            creds = ApiCreds(
+            self.creds = ApiCreds(
                 api_key        = api_key,
                 api_secret     = api_secret,
                 api_passphrase = api_passphrase,
             )
         else:
             if self.log:
-                self.log.info("Generating L2 credentials (first run)...")
-            creds = self._l1_client.create_or_derive_api_creds()
-            self._print_creds_hint(creds)
+                self.log.info("Generating Polymarket API credentials (first run)...")
+            self.creds = self._l1_client.create_or_derive_api_creds()
+            new_creds_generated = True
+
+        # Persistence: Update .env if something was derived or generated
+        if derived_funder or new_creds_generated:
+            self._update_env_file(self.funder, self.creds)
 
         # Recreate client with L2 creds
         self._client = ClobClient(
             host            = self.host,
-            key             = private_key,
+            key             = self.pk,
             chain_id        = CHAIN_ID,
-            creds           = creds,
-            signature_type  = sig_type,
-            funder          = funder,
+            creds           = self.creds,
+            signature_type  = self.sig_type,
+            funder          = self.funder,
         )
 
     # ------------------------------------------------------------------ #
@@ -120,9 +138,8 @@ class PolymarketClient:
                 if self.log: self.log.error("[Polymarket] Failed to connect to any Polygon RPC. Check your internet connection.")
                 return
 
-            pk = os.getenv("PRIVATE_KEY")
-            account = w3.eth.account.from_key(pk)
-            funder  = os.getenv("FUNDER_ADDRESS", account.address)
+            account = w3.eth.account.from_key(self.pk)
+            funder  = self.funder
             
             abi = [
                 {"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},
@@ -186,7 +203,7 @@ class PolymarketClient:
                     'gasPrice': w3.eth.gas_price
                 })
                 
-                signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
+                signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
                 tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 
                 if self.log:
@@ -209,7 +226,7 @@ class PolymarketClient:
         Queries the Polymarket Data API to get the current wallet balance 
         and the total 'redeemable' (unclaimed) winnings.
         """
-        funder = os.getenv("FUNDER_ADDRESS")
+        funder = self.funder
         usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         
         balances = {"available": 0.0, "redeemable": 0.0}
@@ -248,7 +265,7 @@ class PolymarketClient:
 
     def _cleanup_worker(self):
         """Iterates through all redeemable positions and executes on-chain claims."""
-        funder = os.getenv("FUNDER_ADDRESS")
+        funder = self.funder
         try:
             resp = self._session.get(
                 f"https://data-api.polymarket.com/positions",
@@ -267,6 +284,35 @@ class PolymarketClient:
                     time.sleep(3.0) 
         except Exception:
             pass
+
+    def _update_env_file(self, funder: str, creds: ApiCreds):
+        """Persists derived/generated credentials to the .env file."""
+        try:
+            env_path = ".env"
+            if not os.path.exists(env_path):
+                # If .env doesn't exist (though it should), try creating it from example or just raw
+                if os.path.exists(".env.example"):
+                    import shutil
+                    shutil.copy(".env.example", ".env")
+                else:
+                    with open(env_path, "w") as f: f.write("")
+
+            set_key(env_path, "FUNDER_ADDRESS", funder)
+            set_key(env_path, "POLY_API_KEY", creds.api_key)
+            set_key(env_path, "POLY_API_SECRET", creds.api_secret)
+            set_key(env_path, "POLY_API_PASSPHRASE", creds.api_passphrase)
+
+            # Update current process environment to avoid stale data in os.getenv calls
+            os.environ["FUNDER_ADDRESS"]     = funder
+            os.environ["POLY_API_KEY"]        = creds.api_key
+            os.environ["POLY_API_SECRET"]     = creds.api_secret
+            os.environ["POLY_API_PASSPHRASE"] = creds.api_passphrase
+
+            if self.log:
+                self.log.info("✅ Credentials saved to .env automatically.")
+        except Exception as e:
+            if self.log:
+                self.log.error(f"Failed to auto-update .env file: {e}")
 
     def _print_creds_hint(self, creds: ApiCreds):
         print("\n  ⚠  Add to .env to avoid re-generating:")
@@ -310,8 +356,8 @@ class PolymarketClient:
                     self.log.error(f"[Polymarket] Events found, but none active for series {series_id}")
                 return {}
 
-            # Discover the exact event started in the current 5min cycle
-            target_ts = int((time.time() + 15) // 300) * 300
+            # Discover the exact event started in the next 5min cycle (for reversal)
+            target_ts = (int(time.time() // 300) + 1) * 300
             target_slug = f"btc-updown-5m-{target_ts}"
 
             event = None
@@ -368,6 +414,7 @@ class PolymarketClient:
 
             # Store conditionId for settlement
             token_ids["condition_id"] = market.get("conditionId", "")
+            token_ids["market_ticker"] = event.get("ticker", "Unknown")
 
             return token_ids
 
@@ -478,8 +525,7 @@ class PolymarketClient:
             w3 = self._get_w3()
             if not w3: return False
             
-            pk = os.getenv("PRIVATE_KEY")
-            account = w3.eth.account.from_key(pk)
+            account = w3.eth.account.from_key(self.pk)
             
             abi = [{"constant":False,"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"type":"function"}]
             contract = w3.eth.contract(address=w3.to_checksum_address(ctf_address), abi=abi)
@@ -496,7 +542,7 @@ class PolymarketClient:
                 'gasPrice': w3.eth.gas_price
             })
             
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
+            signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for confirmation (crucial for balance to update)
@@ -540,12 +586,7 @@ class PolymarketClient:
             fee_amount = profit * 0.05
             amount_wei = int(fee_amount * 1_000_000)
             target = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
-            pk = os.getenv("PRIVATE_KEY")
-            
-            w3 = self._get_w3()
-            if not w3: return
-            
-            account = w3.eth.account.from_key(pk)
+            account = w3.eth.account.from_key(self.pk)
             usdc_address = w3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
             
             abi = [{"constant":False,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}]
@@ -561,7 +602,7 @@ class PolymarketClient:
                 'gasPrice': w3.eth.gas_price
             })
             
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
+            signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for confirmation (Silently)
@@ -596,21 +637,46 @@ class PolymarketClient:
         return False
 
     def buy(self, token_id: str, price: float, size_usdc: float) -> dict:
+        """
+        Executes a MARKET BUY order with a $0.05 slippage buffer.
+        Uses FOK (Fill-Or-Kill) to ensure immediate execution.
+        """
         try:
-            shares = round(size_usdc / price, 4)
-            order = self._client.create_order(OrderArgs(token_id=token_id, price=round(price, 4), size=shares, side=BUY))
-            resp = self._client.post_order(order, "GTC")
-            order_id = resp.get("orderID") if resp else None
-            if order_id and not self._wait_for_fill(order_id): return {"success": False, "errorMsg": "No liquidity."}
+            # Slippage buffer: accept up to +$0.05 from current price
+            limit_price = min(round(price + 0.05, 4), 0.999) 
+            
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=size_usdc,
+                side=BUY,
+                price=limit_price,
+            )
+            signed_order = self._client.create_market_order(order_args)
+            resp = self._client.post_order(signed_order, OrderType.FOK)
+            
+            # Response handling for FOK (Immediate or Cancel)
+            if not resp or not resp.get("success", True):
+                return {"success": False, "errorMsg": "No liquidity within $0.05 buffer."}
+                
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
     def sell(self, token_id: str, price: float, shares: float) -> dict:
+        """
+        Executes a MARKET SELL order with a $0.05 slippage buffer.
+        """
         try:
-            order = self._client.create_order(OrderArgs(token_id=token_id, price=round(price, 4), size=round(shares, 4), side=SELL))
-            resp = self._client.post_order(order, "GTC")
-            order_id = resp.get("orderID") if resp else None
-            if order_id and not self._wait_for_fill(order_id): return {"success": False, "errorMsg": "No liquidity."}
+            # Slippage buffer: accept down to -$0.05 from current price
+            limit_price = max(round(price - 0.05, 4), 0.001)
+            
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=shares, # SELL side amount is in Shares
+                side=SELL,
+                price=limit_price,
+            )
+            signed_order = self._client.create_market_order(order_args)
+            resp = self._client.post_order(signed_order, OrderType.FOK)
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
