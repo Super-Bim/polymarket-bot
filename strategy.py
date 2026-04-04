@@ -6,6 +6,7 @@ import time
 import threading
 from enum import Enum
 from typing import Optional, Dict
+from time_utils import synced_time
 
 from config import (
     ENTRY_PRICE_THRESHOLD,
@@ -57,7 +58,7 @@ class Trade:
         self.shares      = shares
         self.order_id    = order_id
         self.condition_id = condition_id
-        self.entry_time  = time.time()
+        self.entry_time  = synced_time()
 
 
 # ------------------------------------------------------------------ #
@@ -149,7 +150,7 @@ class Strategy:
                 return
 
             self.sequence_direction = direction
-            self.sequence_time      = candles[-1].close_time / 1000.0
+            self.sequence_time      = synced_time()
             self.target_side        = opposite
             self.target_token_id    = token_id
             self.trade_1            = None
@@ -167,7 +168,7 @@ class Strategy:
         Controls entry windows and monitors positions.
         """
         with self._lock:
-            now = time.time()
+            now = synced_time()
 
             # Price checks rate-limit
             if now - self._last_price_check < PRICE_POLL_INTERVAL:
@@ -237,7 +238,7 @@ class Strategy:
                         # Loss logic
                         if is_trade_1:
                             self.log.loss_signal(f"Initial trade lost. Starting Gale 1...")
-                            self.martingale_start = time.time()
+                            self.martingale_start = synced_time()
                             self._set_state(State.MARTINGALE_WAIT)
                         else:
                             if self.gale_count >= MAX_GALES:
@@ -252,7 +253,7 @@ class Strategy:
                                     f"Gale {self.gale_count} lost. "
                                     f"Waiting for Gale {self.gale_count + 1} opportunity..."
                                 )
-                                self.martingale_start = time.time()
+                                self.martingale_start = synced_time()
                                 self._set_state(State.MARTINGALE_WAIT)
 
             # If we transitioned to WAIT, try Gale immediately
@@ -273,7 +274,8 @@ class Strategy:
 
     def _try_first_entry(self, elapsed: float):
         price = self.poly.get_ask_price(self.target_token_id)
-        self.log.price_check(self.target_side, price, elapsed, ENTRY_WINDOW_SECONDS)
+        bid   = self.poly.get_bid_price(self.target_token_id)
+        self.log.price_check(self.target_side, price, elapsed, ENTRY_WINDOW_SECONDS, bid=bid)
 
         if price <= ENTRY_PRICE_THRESHOLD and price > 0.02:
             success = self._place_buy(
@@ -291,10 +293,12 @@ class Strategy:
             return # Awaits token load if API is delayed
             
         price = self.poly.get_ask_price(target_token)
+        bid   = self.poly.get_bid_price(target_token)
         gale_num = self.gale_count + 1
         self.log.price_check(
             self.target_side, price, elapsed,
-            MARTINGALE_WINDOW_SECONDS, is_martingale=True,
+            MARTINGALE_WINDOW_SECONDS, is_martingale=True, 
+            bid=bid
         )
 
         is_market_gale = self.gale_count >= 1  # Gale 2 onwards
@@ -370,7 +374,7 @@ class Strategy:
         return round(prev_size * MARTINGALE_MULTIPLIER, 2)
 
     def _refresh_tokens_if_needed(self, force: bool = False):
-        now = time.time()
+        now = synced_time()
         if force or (now - self._last_token_refresh > MARKET_REFRESH_INTERVAL):
             new_ids = self.poly.fetch_market_tokens()
             if new_ids:

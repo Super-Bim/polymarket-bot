@@ -4,6 +4,7 @@
 
 import sys
 from datetime import datetime
+from time_utils import synced_time
 
 # ANSI color codes
 RESET   = "\033[0m"
@@ -23,7 +24,7 @@ DLINE   = "═" * 60
 
 
 def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.fromtimestamp(synced_time()).strftime("%H:%M:%S")
 
 
 def _tag(label: str, color: str) -> str:
@@ -35,7 +36,7 @@ class BotLogger:
 
     def header(self):
         print(f"\n{CYAN}{BOLD}{DLINE}{RESET}")
-        print(f"{CYAN}{BOLD}  ▶  POLYMARKET BTC UP/DOWN 5M BOT{RESET}")
+        print(f"{CYAN}{BOLD}  ▶  POLYMASTER-BOT BTC UP/DOWN 5M BOT{RESET}")
         print(f"{CYAN}{BOLD}{DLINE}{RESET}\n")
 
     def info(self, msg: str):
@@ -83,15 +84,17 @@ class BotLogger:
         print(f"{DIM}{LINE}{RESET}")
 
 
-    def price_check(self, side: str, price: float, elapsed: float, window: float, is_martingale: bool = False):
+    def price_check(self, side: str, price: float, elapsed: float, window: float, is_martingale: bool = False, bid: float = 0):
         label   = "MARTINGALE" if is_martingale else "ENTRY     "
         color   = MAGENTA if is_martingale else CYAN
         ok      = price <= 0.40
         pmark   = f"{GREEN}✔ BELOW LIMIT{RESET}" if ok else f"{YELLOW}above limit{RESET}"
         bar     = _progress_bar(elapsed, window)
+        
+        bid_str = f" (Bid: {bid:.3f})" if bid > 0 else ""
         print(
             f"{DIM}{_ts()}{RESET} {color}[{label}]{RESET} "
-            f"Price {side}: {BOLD}{price:.3f}{RESET}  {pmark}  "
+            f"Price {side}: {BOLD}{price:.3f}{RESET}{bid_str}  {pmark}  "
             f"Time: {bar} {elapsed:.0f}s/{window:.0f}s"
         )
 

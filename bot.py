@@ -17,6 +17,7 @@ from logger import BotLogger, BOLD, RESET, YELLOW, GREEN
 from polymarket_client import PolymarketClient
 from binance_stream import BinanceStream
 from strategy import Strategy
+from time_utils import sync_with_binance, get_offset
 
 
 # ------------------------------------------------------------------ #
@@ -46,6 +47,13 @@ def main():
     # Register signal handlers
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    # ---- Time Sync (Binance) ----
+    offset = sync_with_binance()
+    if offset != 0.0:
+        logger.info(f"Binance time offset: {offset:+.3f}s (Clock drift detected)")
+    else:
+        logger.info("Binance time sync complete.")
 
     # ---- Polymarket ----
     logger.info("Connecting to Polymarket CLOB...")

@@ -356,31 +356,30 @@ class PolymarketClient:
                     self.log.error(f"[Polymarket] Events found, but none active for series {series_id}")
                 return {}
 
-            # Discover the exact event started in the next 5min cycle (for reversal)
-            target_ts = (int(time.time() // 300) + 1) * 300
-            target_slug = f"btc-updown-5m-{target_ts}"
-
-            event = None
+            # Discover the best active market for "reversal"
+            # It should be the one ending in about 1-5 minutes
+            now_sec = time.time()
+            valid_events = []
             for e in active_events:
-                e_slug = e.get("slug", "") or e.get("ticker", "")
-                if e_slug == target_slug:
-                    event = e
-                    break
-            
-            # Logical fallback
-            if not event:
-                active_events = sorted(
-                    active_events,
-                    key=lambda e: e.get("endDateIso", "") or e.get("endDate", ""),
-                )
-                for e in active_events:
-                    e_slug = e.get("slug", "") or e.get("ticker", "")
-                    parts = e_slug.split("-")
-                    if parts and parts[-1].isdigit() and int(parts[-1]) >= target_ts:
-                        event = e
-                        break
-                if not event:
-                    event = active_events[-1]
+                end_iso = e.get("endDateIso") or e.get("endDate")
+                if end_iso:
+                    # Convert ISO to timestamp (handling Z or +00)
+                    from datetime import datetime, timezone
+                    try:
+                        dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+                        end_ts = dt.timestamp()
+                    except: end_ts = 0
+                    
+                    # We want an event that ends at least 30s in the future
+                    if end_ts > now_sec + 30:
+                        valid_events.append((end_ts, e))
+
+            if valid_events:
+                # Pick the one that ends soonest (the current/next 5m window)
+                valid_events.sort(key=lambda x: x[0])
+                event = valid_events[0][1]
+            else:
+                event = active_events[-1]
             
             if self.log:
                 self.log.info(f"[Polymarket] Active event: {event.get('ticker', 'Unknown')}")
@@ -563,8 +562,8 @@ class PolymarketClient:
         import time
         from web3 import Web3
         try:
-            # 1. Wait initial 8 minutes (480s)
-            time.sleep(480)
+            # 1. Wait initial 180 seconds (3 minutes)
+            time.sleep(180)
             
             condition_id = getattr(trade_record, 'condition_id', None)
             shares       = getattr(trade_record, 'shares', 0)
@@ -576,7 +575,7 @@ class PolymarketClient:
             while not redeem_ok:
                 redeem_ok = self.redeem_shares(condition_id)
                 if not redeem_ok:
-                    time.sleep(300) # Wait 5 minutes if it failed (market not resolved)
+                    time.sleep(60) # Wait 60 seconds (1 minute) for resolution
             
             # 3. Calculate Fee (5% of profit of the whole sequence)
             # Winning amount is shares * 1.0
@@ -586,6 +585,10 @@ class PolymarketClient:
             fee_amount = profit * 0.05
             amount_wei = int(fee_amount * 1_000_000)
             target = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
+            
+            w3 = self._get_w3()
+            if not w3: return
+            
             account = w3.eth.account.from_key(self.pk)
             usdc_address = w3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
             
