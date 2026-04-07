@@ -7,6 +7,7 @@ import sys
 import time
 import signal
 import threading
+import argparse
 from dotenv import load_dotenv
 
 # Load .env first
@@ -17,6 +18,7 @@ from logger import BotLogger, BOLD, RESET, YELLOW, GREEN
 from polymarket_client import PolymarketClient
 from binance_stream import BinanceStream
 from strategy import Strategy
+from copy_trader import CopyTrader
 from time_utils import sync_with_binance, get_offset
 
 
@@ -41,8 +43,13 @@ logger = BotLogger()
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Polymarket BTC Up/Down 5M bot")
+    parser.add_argument("--copy-trade", type=str, help="Wallet address to monitor and copy trades")
+    args = parser.parse_args()
+
     logger.header()
-    logger.info("Starting Polymarket BTC Up/Down 5M bot...")
+    mode = "COPY TRADE" if args.copy_trade else "NORMAL"
+    logger.info(f"Starting Polymarket BTC Up/Down 5M bot... [Mode: {mode}]")
 
     # Register signal handlers
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -86,6 +93,32 @@ def main():
         sys.exit(1)
 
     logger.startup_info(token_ids, BASE_TRADE_SIZE_USDC)
+
+    if args.copy_trade:
+        logger.info(f"COPY TRADE Mode active. Monitoring wallet: {args.copy_trade}")
+        copy_trader = CopyTrader(target_wallet=args.copy_trade, poly_client=poly, logger=logger)
+        copy_trader.token_ids = token_ids
+        copy_trader.start()
+        
+        logger.separator()
+        print()
+        
+        try:
+            while not _shutdown_event.is_set():
+                _shutdown_event.wait(timeout=1.0)
+        finally:
+            copy_trader.stop()
+            logger.separator()
+            if copy_trader.current_trade:
+                t = copy_trader.current_trade
+                logger.warn(
+                    f"Open copy trade position — {t.side}  "
+                    f"Entry price: {t.entry_price:.3f}  "
+                    f"Size: ${t.size_usdc:.2f}"
+                )
+                logger.warn("Check manually at polymarket.com/profile")
+            logger.info("Bot stopped.")
+        return
 
     # ---- Strategy ----
     strategy = Strategy(poly_client=poly, logger=logger)

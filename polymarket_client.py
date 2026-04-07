@@ -216,10 +216,61 @@ class PolymarketClient:
             else:
                 if self.log:
                     self.log.info(f"✅ [Polymarket] Spender authorized (Allowance: {current_allowance/1e6:,.0f} USDC).")
-                    
+            
+            # --- Check CTF ERC1155 Allowance (for Selling) ---
+            ctf_addr = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+            ctf_abi = [
+                {"constant":True,"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"type":"function"},
+                {"constant":False,"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"type":"function"}
+            ]
+            ctf_contract = w3.eth.contract(address=w3.to_checksum_address(ctf_addr), abi=ctf_abi)
+            is_approved = ctf_contract.functions.isApprovedForAll(
+                w3.to_checksum_address(funder),
+                w3.to_checksum_address(spender)
+            ).call()
+
+            if not is_approved:
+                if self.log: self.log.warn(f"⚠ [Polymarket] CTF Exchange Not Approved. Authorizing for Sells...")
+                matic_balance = w3.eth.get_balance(account.address)
+                if matic_balance < w3.to_wei(0.01, 'ether'):
+                    if self.log: self.log.error("[Polymarket] Insufficient MATIC for CTF approval!")
+                    return
+                tx2 = ctf_contract.functions.setApprovalForAll(
+                    w3.to_checksum_address(spender),
+                    True
+                ).build_transaction({
+                    'from': account.address,
+                    'nonce': w3.eth.get_transaction_count(account.address),
+                    'gas': 150000,
+                    'gasPrice': w3.eth.gas_price
+                })
+                signed_tx2 = w3.eth.account.sign_transaction(tx2, private_key=self.pk)
+                tx_hash2 = w3.eth.send_raw_transaction(signed_tx2.raw_transaction)
+                if self.log: self.log.info(f"✅ [Polymarket] CTF Approval sent! TX: {w3.to_hex(tx_hash2)}")
+                w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=120)
+                if self.log: self.log.info("✅ [Polymarket] CTF shares authorized for exchange successfully.")
+            else:
+                if self.log: self.log.info(f"✅ [Polymarket] CTF shares authorized for exchange.")
+
         except Exception as e:
             if self.log:
                 self.log.error(f"[Polymarket] Error during allowance check/approval: {e}")
+
+    def get_exact_token_balance(self, token_id: str) -> float:
+        """Fetch exact micro-shares balance for an event token on Polygon."""
+        try:
+            w3 = self._get_w3()
+            if not w3: return 0.0
+            ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+            abi = [{"constant":True,"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]
+            contract = w3.eth.contract(address=w3.to_checksum_address(ctf_address), abi=abi)
+            bal_wei = contract.functions.balanceOf(
+                w3.to_checksum_address(self.funder), 
+                int(token_id)
+            ).call()
+            return bal_wei / 1_000_000
+        except Exception:
+            return 0.0
 
     def get_balances(self) -> Dict[str, float]:
         """

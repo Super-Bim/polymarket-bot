@@ -20,6 +20,7 @@ from config import (
     PRICE_POLL_INTERVAL,
     MARKET_SLUG,
     MARKET_REFRESH_INTERVAL,
+    PROFIT_TARGET_PERCENT,
 )
 
 
@@ -186,15 +187,25 @@ class Strategy:
                 threading.Thread(target=self._refresh_tokens_if_needed, kwargs={"force": True}, daemon=True).start()
 
             if self._state == State.SCANNING:
-                elapsed = now - self.sequence_time
+                elapsed = now - (candle.open_time / 1000.0)
                 if elapsed > ENTRY_WINDOW_SECONDS:
                     self._set_state(State.IDLE)
-                    self.log.timeout("Entry window (120s) expired without condition")
+                    self.log.timeout(f"Entry window ({ENTRY_WINDOW_SECONDS}s) expired without condition")
                     return
                 self._try_first_entry(elapsed)
 
-            elif self._state == State.IN_TRADE_1:
-                pass # Waits for natural candle closing
+            elif self._state in (State.IN_TRADE_1, State.IN_GALE):
+                # Global Take Profit / Cash Out Check
+                if PROFIT_TARGET_PERCENT > 0:
+                    trade = self.trade_1 if self._state == State.IN_TRADE_1 else self.gales[-1]
+                    current_price = self.poly.get_bid_price(trade.token_id)
+                    if current_price > 0.01:
+                        current_value = current_price * trade.shares
+                        profit_pct = ((current_value / trade.size_usdc) - 1.0) * 100
+                        if profit_pct >= PROFIT_TARGET_PERCENT:
+                            self.log.info(f"💰 Global Profit reached! (+{profit_pct:.2f}%). Executing early Cash Out!")
+                            self._execute_cash_out(trade, current_price)
+                            return
 
             elif self._state == State.MARTINGALE_WAIT:
                 elapsed = now - self.martingale_start
@@ -204,10 +215,6 @@ class Strategy:
                     self._reset_context()
                     return
                 self._try_gale(elapsed)
-
-            elif self._state == State.IN_GALE:
-                # No auto-close / Hold-to-Maturity
-                pass
                 
             elif self._state == State.VERIFYING_RESULT:
                 # Just waiting for _verify_and_resolve thread to finish
@@ -220,6 +227,11 @@ class Strategy:
         """
         with self._lock:
             self.log.candle_close(candle)
+
+            if self._state == State.SCANNING:
+                self.log.timeout("Candle closed without entry. Cancelling scan.")
+                self._set_state(State.IDLE)
+                self._reset_context()
 
             if self._state in (State.IN_TRADE_1, State.IN_GALE):
                 is_trade_1 = self._state == State.IN_TRADE_1
@@ -360,6 +372,23 @@ class Strategy:
         else:
             self.log.order_failed(resp)
             return False
+
+    def _execute_cash_out(self, trade, price):
+        exact_shares = self.poly.get_exact_token_balance(trade.token_id)
+        if exact_shares <= 0.0:
+            self.log.warn(f"⚠ No on-chain balance available for global Cash Out.")
+            self._set_state(State.IDLE)
+            self._reset_context()
+            return
+            
+        self.log.info(f"🔄 Executing Sell via CASH_OUT at {price:.3f} (Qty: {exact_shares:.4f} shares)...")
+        resp = self.poly.sell(trade.token_id, price, exact_shares)
+        if resp.get("success") or resp.get("status") in ("live", "matched"):
+            self.log.info(f"✅ Cash Out CLOSED successfully. Returning to IDLE mode.")
+            self._set_state(State.IDLE)
+            self._reset_context()
+        else:
+            self.log.error(f"❌ Early Cash Out failed: {resp.get('errorMsg', resp)}")
 
 
     # ---------------------------------------------------------------- #

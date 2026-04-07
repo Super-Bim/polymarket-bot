@@ -1,74 +1,63 @@
-# polymarket-bot
-A bot focused on automating binary options (UP/DOWN options) on the **Polymarket** platform. The bot uses the Binance Oracle via WebSocket in real time for millimeter-precise decision-making and executes orders directly in the Polymarket Clob (Order Book) using Smart Contracts.
-## 🚀 Main Features
+# Polymaster BTC Up/Down 5M Bot 🎯
 
-- **Real-Time Binance Oracle:** Connects directly to Binance WebSockets to extract directional signals in the exact millisecond the 5-minute (5m) candle closes.
-- **Pattern Detection:** Reads the market flow and identifies reversal triggers based on the premise of force exhaustion (e.g. 3 consecutive candles closing in the same color generates a trigger for the opposite color).
-- **Hold-to-Maturity Execution:** After a validated entry with price limits (instant Limit Order), the robot responsibly waits for the candle's expiration maturity to define the natural outcome without panicking over intra-candle fluctuations.
-- **Autonomous Martingale Ecosystem:** If the candle resolves in a loss, the bot automatically feeds back, entering the next cycle window with a recovery injection (2x Multiplier) to secure base profit — limited to a safe ceiling of rounds (Gales) defined in the settings.
-- **Anti-Ghost Resilience:** Internal sweep routines block the dreaded Polymarket Orderbook "Fakes" (stuck orders, lack of fluidity, L2 freezes). It requires cross-confirmation on the Blockchain.
-- **Constant Order Sweeping:** Dispatches asynchronous sweeps on your proxy-wallet to cancel orphan operations from the past, automatically returning inactive margin back to your bankroll.
+An advanced Python bot engineered to automate trading in the 5-minute Bitcoin (UP/DOWN) market on the **Polymarket** platform. Operating securely via Smart Contracts on the Polygon network, this bot interfaces seamlessly with Polymarket's Central Limit Order Book (CLOB).
+
+It supports two distinct execution modes: **Binance Oracle Strategy** (Pattern matching) and **Copy Trade** (On-chain Wallet Monitoring).
 
 ---
 
-## 🛠 Prerequisites and Installation
+## 🚀 Key Features
 
-1. **Python 3.10+**: The robot requires native language running on your server/machine. ([Download Python](https://www.python.org/downloads/))
-2. **Dependency Installation**: Open the robot's folder in the terminal and install the required libraries contained in the `requirements.txt` file:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
----
-
-## ⚙ Environment Configuration (.env)
-
-The robot connects to your Polymarket Proxy Wallet confidentially. **DO NOT share the `.env` file with anyone.**
-
-To configure:
-1. Make a copy of the `.env.example` file and rename it to `.env`.
-   - This can be done via terminal by running: `copy .env.example .env` (Windows) or `cp .env.example .env` (Linux/Mac).
-2. Open the generated `.env` file and fill it with your credentials. The tags and comments inside the file will guide the correct filling of your `PRIVATE_KEY`, the address of your proxy wallet `FUNDER_ADDRESS`, the signature type `SIGNATURE_TYPE`, and the base trade size `TRADE_SIZE_USDC`.
-
-*Tip:* All limits, initial bet sizes, rates, and Martingale targets can be easily customized inside the `config.py` file if you want to experiment with other approaches.
+- **Dual Execution Modes**: 
+  - `NORMAL`: Intercepts Binance WebSockets in real-time. Capable of analyzing short-term market momentum and automatically placing counter-trend Martingale sequences.
+  - `COPY TRADE`: Stealthily monitors a specific target wallet directly via Polygon Web3 RPC. It securely replicates the target's exact market movements (entries and exits) with zero API rate-limit delays, using your personal risk sizes.
+- **Global Take Profit (Early Cash Out)**: Never leave money on the table. Both modes support an aggressive `PROFIT_TARGET_PERCENT` guard. When the configuration target is reached mid-candle, the bot autonomously sweeps the Orderbook, selling your micro-shares at Market value and securing instant profit before the candle closes.
+- **Automated Profit Claim (Redeem)**: No more holding unredeemed tickets. An asynchronous worker runs in the background continuously scanning your completed positions. Once a market expires favorably, it automatically clears the CTF Smart Contracts and transfers your winnings back as raw `USDC.e`.
+- **Zero Configuration Exchange Allowances**: Booting for the first time? The bot flawlessly scans and injects the `ERC20` (USDC) and `ERC1155` (CTF) Approval Contracts to the Polymarket Exchange on its own. 
+- **Autonomous Martingale Ecosystem**: (Normal Mode only). Reacts to losses sequentially and responsibly, increasing bet sizes linearly to safely recoup capital within a safe margin of `MAX_GALES` limits.
 
 ---
 
-## ▶ How to Start
+## ⚙️ How it Works
 
-With the environment ready and your `.env` well configured, just run the orchestrator engine in the terminal:
+### 1. Configuration (`config.py`)
+No complex setups. Out of the box, `config.py` provides highly readable and simple options you can tweak:
+- `BASE_TRADE_SIZE_USDC`: The base value you are comfortable investing per entry (minimum $1.0).
+- `PROFIT_TARGET_PERCENT`: Target percentage to lock-in profits aggressively (e.g. `30.0` for 30%). Set to `0.0` to disable the feature and Hold-to-Maturity.
+- *(Normal Mode)* Threshold Limits, sequence lengths, and Martingale multipliers for your risk hunger.
 
+### 2. Authentication (`.env`)
+The bot operates via your decentralized **Proxy Wallet** (Gnosis Safe / Polymarket standard):
+1. Duplicate the `.env.example` file and rename it to `.env`.
+2. Inside `.env`, paste your `PRIVATE_KEY` and the `FUNDER_ADDRESS` (Your proxy wallet address available in your Polymarket profile).
+> **⚠️ WARNING:** Keep the `.env` local and secure. Never commit it to GitHub.
+
+---
+
+## ▶️ Usage Instructions
+
+Install the necessary dependencies first:
+```bash
+pip install -r requirements.txt
+```
+
+### Starting the Binance Oracle Mode (Normal)
+Monitors Binance's `BTCUSDT@kline_5m` stream, waiting for consecutive color sequence formations before placing a Limit Order reversal:
 ```bash
 python bot.py
 ```
 
-The bot will instantly download the old Binance candles to avoid waiting too long, and present a clean and colorful log interface pointing the steps of candle monitoring, opening and freely reporting transactions.
+### Starting the Copy Trade Mode
+Monitors a top trader's address directly on the Blockchain. Whenever the target wallet buys or sells *BTC Up/Down* shares, your bot copies the action using your personal `BASE_TRADE_SIZE_USDC`.
+```bash
+python bot.py --copy-trade 0xTARGET_WALLET_ADDRESS_HERE
+```
 
 ---
 
-## 📈 Profit Claim (Cash Out / Redeem)
+## 🛠️ Auto-Management Capabilities
+- **Clock Drift Mitigation**: Ensures perfect milisecond-alignment by keeping your OS time firmly linked to Binance and Polymarket server epochs.
+- **Micro-Slippage Safety**: Rejects unpredictable token surges via strictly controlled FOK (Fill-Or-Kill) transactions. If the pool becomes volatile mid-execution, your capital is preserved.
+- **Background Keepalive**: Prevents timeout disconnection gracefully via an active Web3 Heartbeat algorithm.
 
-**Attention:** Due to the L2 Gnosis Safe infrastructure and the Gasless necessity of the Safe itself (Proxy Wallet), the bot executes an aggressive commercial tactic and **validates profits**, however **Redeeming Matured Positions** must be periodically done manually directly in the "Portfolio / Redeem Positions" tab on your official Polymarket website dashboard so that the Balance returns safely as available USDC. The bot never burns your tickets without your manual order on the exchange.
----
-
-**Attention if you use a master wallet with a direct connection:**
-We suggest creating a separate wallet for running the bot, as you will need to use the private key of that wallet.
-
-With this type of direct connection, you need to have a balance in USD Coin (PoS) = USDC.e and a balance in Polygon to pay for network gas.
-
-Modify the config.py file to suit your strategy.
-
----
-
-**Want to become one of our sponsors?**
-
-There are two ways to help us:
-**1. Share our project with others.**
-**2. You can send us a tip via Polygon network to our wallet:** 0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4
-
-**Join our Discord group for questions, suggestions, or to chat directly with us.**
-
-https://discord.gg/zwqqvNEm4u
-
----
-*Keep your terminal free from power suspension so that the WebSocket oracle does not suffer from latency! Good profits!* 💸
+*Maintain your workstation/vps running uninterrupted for optimal WebSockets latency. High profitability and safe trading!* 💸
