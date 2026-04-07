@@ -27,9 +27,8 @@ No complex setups. Out of the box, `config.py` provides highly readable and simp
 - *(Normal Mode)* Threshold Limits, sequence lengths, and Martingale multipliers for your risk hunger.
 
 ### 2. Authentication (`.env`)
-The bot operates via your decentralized **Proxy Wallet** (Gnosis Safe / Polymarket standard):
-1. Duplicate the `.env.example` file and rename it to `.env`.
-2. Inside `.env`, paste your `PRIVATE_KEY` and the `FUNDER_ADDRESS` (Your proxy wallet address available in your Polymarket profile).
+The bot operates via your decentralized **Wallet** 
+1. Inside `.env`, paste your `PRIVATE_KEY`
 > **⚠️ WARNING:** Keep the `.env` local and secure. Never commit it to GitHub.
 
 ---
