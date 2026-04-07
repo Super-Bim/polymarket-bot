@@ -194,10 +194,10 @@ class Strategy:
                     return
                 self._try_first_entry(elapsed)
 
-            elif self._state in (State.IN_TRADE_1, State.IN_GALE):
-                # Global Take Profit / Cash Out Check
+            elif self._state == State.IN_TRADE_1:
+                # Global Take Profit / Cash Out Check (First trade only)
                 if PROFIT_TARGET_PERCENT > 0:
-                    trade = self.trade_1 if self._state == State.IN_TRADE_1 else self.gales[-1]
+                    trade = self.trade_1
                     current_price = self.poly.get_bid_price(trade.token_id)
                     if current_price > 0.01:
                         current_value = current_price * trade.shares
@@ -206,6 +206,10 @@ class Strategy:
                             self.log.info(f"💰 Global Profit reached! (+{profit_pct:.2f}%). Executing early Cash Out!")
                             self._execute_cash_out(trade, current_price)
                             return
+
+            elif self._state == State.IN_GALE:
+                # Early Cash Out is disabled during Martingale to avoid sacrificing recovery stakes.
+                pass
 
             elif self._state == State.MARTINGALE_WAIT:
                 elapsed = now - self.martingale_start
