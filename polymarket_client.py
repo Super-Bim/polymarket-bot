@@ -315,26 +315,28 @@ class PolymarketClient:
         t.start()
 
     def _cleanup_worker(self):
-        """Iterates through all redeemable positions and executes on-chain claims."""
+        """Continuously checks for redeemable positions every 5 minutes and executes on-chain claims."""
         funder = self.funder
-        try:
-            resp = self._session.get(
-                f"https://data-api.polymarket.com/positions",
-                params={"user": funder},
-                timeout=10
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                redeemables = [p.get("conditionId") for p in data if p.get("redeemable") is True and p.get("conditionId")]
-                
-                # Deduplicate
-                unique_cids = list(set(redeemables))
-                
-                for cid in unique_cids:
-                    self.redeem_shares(cid)
-                    time.sleep(3.0) 
-        except Exception:
-            pass
+        while True:
+            try:
+                resp = self._session.get(
+                    f"https://data-api.polymarket.com/positions",
+                    params={"user": funder},
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    redeemables = [p.get("conditionId") for p in data if p.get("redeemable") is True and p.get("conditionId")]
+                    
+                    # Deduplicate
+                    unique_cids = list(set(redeemables))
+                    
+                    for cid in unique_cids:
+                        self.redeem_shares(cid)
+                        time.sleep(3.0) 
+            except Exception:
+                pass
+            time.sleep(300) # Loop every 5 min
 
     def _update_env_file(self, funder: str, creds: ApiCreds):
         """Persists derived/generated credentials to the .env file."""
@@ -588,16 +590,22 @@ class PolymarketClient:
             ).build_transaction({
                 'from': account.address,
                 'nonce': w3.eth.get_transaction_count(account.address),
-                'gas': 150000,
+                'gas': 500000,
                 'gasPrice': w3.eth.gas_price
             })
             
             signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
-            # Wait for confirmation (crucial for balance to update)
-            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            # Wait for confirmation and verify status
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             
+            if receipt.status == 0:
+                if self.log: 
+                    self.log.error(f"❌ [REDEEM] Transaction Reverted! Hash: {w3.to_hex(tx_hash)}")
+                    self.log.warn("⚠ Se você loga usando Google/Email na Polymarket (Proxy Wallet), o bot não tem permissão on-chain para interagir com o resgate nativo diretamente. Resgate pelo Site.")
+                return False
+                
             # LOG TO FILE (STILL VISIBLE IN log.txt)
             try:
                 with open("log.txt", "a", encoding="utf-8") as f:
@@ -606,7 +614,8 @@ class PolymarketClient:
             except: pass
             
             return True
-        except Exception:
+        except Exception as e:
+            if self.log: self.log.error(f"[REDEEM] Exception: {e}")
             return False
 
     def _settlement_worker(self, trade_record, total_spent: float):

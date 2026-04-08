@@ -76,6 +76,18 @@ def main():
         # 3. Start background cleanup (Previous winnings)
         poly.start_background_cleanup()
 
+        # 4. Find open orders and cancel them (Sweep)
+        open_orders = poly.get_open_orders()
+        if open_orders:
+            logger.warn(f"Found {len(open_orders)} open orders from previous execution. Canceling them...")
+            poly.cancel_all_orders()
+            time.sleep(1)
+            # Failsafe: older orphaned orders might be missed by generic cancel_all if API keys changed
+            for o in open_orders:
+                o_id = o.get("id")
+                if o_id:
+                    poly.cancel_order(o_id)
+
     except ValueError as e:
         logger.error(str(e))
         logger.error("Configure the .env file before running. See .env.example")
