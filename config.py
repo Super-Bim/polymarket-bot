@@ -15,13 +15,12 @@ CHAIN_ID        = 137          # Polygon mainnet
 # Use "ALL" to enable all markets simultaneously.
 #
 # Available markets (with confirmed active Polymarket series):
-#   "BTC"  — series 10684  (btc-updown-5m)
-#   "ETH"  — series 10683  (eth-updown-5m)
-#   "XRP"  — series 10685  (xrp-updown-5m)
-#   "SOL"  — series 10686  (sol-updown-5m)
-#
-# Markets NOT currently available on Polymarket:
-#   DOGE, BNB — no active updown-5m series found
+#   "BTC"   — series 10684  (btc-updown-5m)
+#   "ETH"   — series 10683  (eth-updown-5m)
+#   "XRP"   — series 10685  (xrp-updown-5m)
+#   "SOL"   — series 10686  (sol-updown-5m)
+#   "BNB"   — series 11326  (bnb-up-or-down-5m)   ← confirmed active 2026-04
+#   "DOGE"  — series 11325  (doge-up-or-down-5m)  ← confirmed active 2026-04
 #
 # Examples:
 #   ACTIVE_MARKETS = ["BTC"]               # Only BTC
@@ -60,8 +59,20 @@ MARKETS = {
         "binance_ws":         "wss://stream.binance.com:9443/ws/solusdt@kline_5m",
         "binance_rest_symbol": "SOLUSDT",
     },
-    # DOGE and BNB removed — no active updown-5m series on Polymarket as of 2026-04
-    # Re-add them here if/when Polymarket launches those series.
+    "BNB": {
+        "slug":               "bnb-up-or-down-5m",
+        "series_id":          "11326",          # confirmed active 2026-04
+        "binance_symbol":     "BNBUSDT",
+        "binance_ws":         "wss://stream.binance.com:9443/ws/bnbusdt@kline_5m",
+        "binance_rest_symbol": "BNBUSDT",
+    },
+    "DOGE": {
+        "slug":               "doge-up-or-down-5m",
+        "series_id":          "11325",          # confirmed active 2026-04
+        "binance_symbol":     "DOGEUSDT",
+        "binance_ws":         "wss://stream.binance.com:9443/ws/dogeusdt@kline_5m",
+        "binance_rest_symbol": "DOGEUSDT",
+    },
 }
 
 # --- Resolve active market list ---
@@ -70,28 +81,20 @@ def get_active_markets() -> list:
         return list(MARKETS.keys())
     return [m.upper() for m in ACTIVE_MARKETS if m.upper() in MARKETS]
 
-# --- Legacy single-market compatibility (used by some modules directly) ---
-# These are set dynamically by bot.py when running a single market,
-# but kept here as fallback defaults referencing BTC.
-MARKET_SLUG      = MARKETS["BTC"]["slug"]
-MARKET_SERIES_ID = MARKETS["BTC"]["series_id"]
-BINANCE_WS_URL   = MARKETS["BTC"]["binance_ws"]
-SYMBOL           = MARKETS["BTC"]["binance_symbol"]
-CANDLE_INTERVAL  = "5m"
 
 # --- Strategy ---
 SEQUENCE_LENGTH          = 3       # No. of consecutive candles to detect a trend
-ENTRY_PRICE_THRESHOLD    = 0.45    # Max opposite option price to enter
-GALE_1_PRICE_THRESHOLD   = 0.52    # Max price for Gale 1 specifically
+ENTRY_PRICE_THRESHOLD    = 0.48    # Max opposite option price to enter
+GALE_1_PRICE_THRESHOLD   = 0.55    # Max price for Gale 1 specifically
 GALE_2_PLUS_PRICE_THRESHOLD = 0.58 # Max price for Gale 2+
-ENTRY_WINDOW_SECONDS     = 90      # 1st order entry window (seconds)
+ENTRY_WINDOW_SECONDS     = 120      # 1st order entry window (seconds)
 MARTINGALE_WINDOW_SECONDS= 180     # Total window for martingale (seconds)
-MARTINGALE_MULTIPLIER    = 2.75    # Each gale = multiplier x previous gale
+MARTINGALE_MULTIPLIER    = 2.5    # Each gale = multiplier x previous gale
 MAX_GALES                = 10      # Max gales per sequence
 PROFIT_TARGET_PERCENT    = 0    # Overall profit in % for early cash out (both strategies)
 
 # --- Sizing ---
-BASE_TRADE_SIZE_USDC     = 1.0     # Base trade size ($1 minimum)
+BASE_TRADE_SIZE_USDC     = 2     # Base trade size ($1 minimum)
 
 # --- Polling ---
 PRICE_POLL_INTERVAL      = 1       # Seconds between price checks
