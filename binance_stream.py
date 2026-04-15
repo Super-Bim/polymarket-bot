@@ -1,5 +1,5 @@
 # =============================================================
-# binance_stream.py — Binance WebSocket (BTC/USDT 5m candles)
+# binance_stream.py — Binance WebSocket (multi-symbol 5m candles)
 # =============================================================
 
 import json
@@ -7,7 +7,7 @@ import time
 import threading
 import websocket
 from typing import Callable, List, Optional
-from config import BINANCE_WS_URL, SEQUENCE_LENGTH
+from config import SEQUENCE_LENGTH
 
 
 class Candle:
@@ -53,11 +53,15 @@ class BinanceStream:
         on_candle_tick: Callable,
         on_candle_close: Callable,
         logger=None,
+        ws_url: str = "",
+        symbol: str = "BTCUSDT",
     ):
         self.on_sequence    = on_sequence
         self.on_candle_tick = on_candle_tick
         self.on_candle_close = on_candle_close
         self.log            = logger
+        self._ws_url        = ws_url
+        self._symbol        = symbol
 
         self._closed_candles: List[Candle] = []
         self._current: Optional[Candle]    = None
@@ -111,7 +115,8 @@ class BinanceStream:
 
     def _on_open(self, ws):
         if self.log:
-            self.log.success("[Binance] Connected to stream BTCUSDT@kline_5m")
+            sym_lower = self._symbol.lower()
+            self.log.success(f"[Binance] Connected to stream {self._symbol}@kline_5m")
 
     # ------------------------------------------------------------------ #
     # Sequence detection                                                   #
@@ -134,7 +139,7 @@ class BinanceStream:
 
     def _connect(self):
         self._ws = websocket.WebSocketApp(
-            BINANCE_WS_URL,
+            self._ws_url,
             on_message  = self._on_message,
             on_error    = self._on_error,
             on_close    = self._on_close,
@@ -151,10 +156,11 @@ class BinanceStream:
         try:
             import requests
             if self.log:
-                self.log.info("[Binance] Downloading recent history to speed up entries...")
+                self.log.info(f"[Binance:{self._symbol}] Downloading recent history to speed up entries...")
             
             # Get the previous 4 candles (limit=5, ignores the last one which is open)
-            res = requests.get("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=5", timeout=10)
+            url = f"https://api.binance.com/api/v3/klines?symbol={self._symbol}&interval=5m&limit=5"
+            res = requests.get(url, timeout=10)
             klines = res.json()
             
             # The last kline returned by the REST API is usually the CURRENT forming candle.
@@ -180,7 +186,7 @@ class BinanceStream:
             self._check_sequence()
         except Exception as e:
             if self.log:
-                self.log.warn(f"[Binance] Failed to preload history: {e}")
+                self.log.warn(f"[Binance:{self._symbol}] Failed to preload history: {e}")
 
     def start(self):
         """Starts the background stream."""

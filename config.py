@@ -6,19 +6,84 @@
 CLOB_HOST       = "https://clob.polymarket.com"
 GAMMA_API       = "https://gamma-api.polymarket.com"
 CHAIN_ID        = 137          # Polygon mainnet
-MARKET_SLUG     = "btc-updown-5m"
-MARKET_SERIES_ID= "10684"      # Series ID 
 
-# --- Binance ---
-BINANCE_WS_URL  = "wss://stream.binance.com:9443/ws/btcusdt@kline_5m"
-SYMBOL          = "BTCUSDT"
-CANDLE_INTERVAL = "5m"
+# =============================================================
+# MULTI-MARKET CONFIGURATION
+# =============================================================
+# Define which markets the bot will operate on.
+# Set ACTIVE_MARKETS to a list of market keys you want to trade.
+# Use "ALL" to enable all markets simultaneously.
+#
+# Available markets (with confirmed active Polymarket series):
+#   "BTC"  — series 10684  (btc-updown-5m)
+#   "ETH"  — series 10683  (eth-updown-5m)
+#   "XRP"  — series 10685  (xrp-updown-5m)
+#   "SOL"  — series 10686  (sol-updown-5m)
+#
+# Markets NOT currently available on Polymarket:
+#   DOGE, BNB — no active updown-5m series found
+#
+# Examples:
+#   ACTIVE_MARKETS = ["BTC"]               # Only BTC
+#   ACTIVE_MARKETS = ["BTC", "ETH"]        # BTC and ETH
+#   ACTIVE_MARKETS = "ALL"                 # All confirmed markets
+# =============================================================
+ACTIVE_MARKETS = "ALL"   # <-- EDIT THIS to choose your markets
+
+# Market definitions: slug, series_id (confirmed via Polymarket API), Binance symbol & stream
+MARKETS = {
+    "BTC": {
+        "slug":               "btc-updown-5m",
+        "series_id":          "10684",          # confirmed active
+        "binance_symbol":     "BTCUSDT",
+        "binance_ws":         "wss://stream.binance.com:9443/ws/btcusdt@kline_5m",
+        "binance_rest_symbol": "BTCUSDT",
+    },
+    "ETH": {
+        "slug":               "eth-updown-5m",
+        "series_id":          "10683",          # confirmed active (was wrongly 10685)
+        "binance_symbol":     "ETHUSDT",
+        "binance_ws":         "wss://stream.binance.com:9443/ws/ethusdt@kline_5m",
+        "binance_rest_symbol": "ETHUSDT",
+    },
+    "XRP": {
+        "slug":               "xrp-updown-5m",
+        "series_id":          "10685",          # confirmed active (was wrongly 10688)
+        "binance_symbol":     "XRPUSDT",
+        "binance_ws":         "wss://stream.binance.com:9443/ws/xrpusdt@kline_5m",
+        "binance_rest_symbol": "XRPUSDT",
+    },
+    "SOL": {
+        "slug":               "sol-updown-5m",
+        "series_id":          "10686",          # confirmed active
+        "binance_symbol":     "SOLUSDT",
+        "binance_ws":         "wss://stream.binance.com:9443/ws/solusdt@kline_5m",
+        "binance_rest_symbol": "SOLUSDT",
+    },
+    # DOGE and BNB removed — no active updown-5m series on Polymarket as of 2026-04
+    # Re-add them here if/when Polymarket launches those series.
+}
+
+# --- Resolve active market list ---
+def get_active_markets() -> list:
+    if ACTIVE_MARKETS == "ALL":
+        return list(MARKETS.keys())
+    return [m.upper() for m in ACTIVE_MARKETS if m.upper() in MARKETS]
+
+# --- Legacy single-market compatibility (used by some modules directly) ---
+# These are set dynamically by bot.py when running a single market,
+# but kept here as fallback defaults referencing BTC.
+MARKET_SLUG      = MARKETS["BTC"]["slug"]
+MARKET_SERIES_ID = MARKETS["BTC"]["series_id"]
+BINANCE_WS_URL   = MARKETS["BTC"]["binance_ws"]
+SYMBOL           = MARKETS["BTC"]["binance_symbol"]
+CANDLE_INTERVAL  = "5m"
 
 # --- Strategy ---
 SEQUENCE_LENGTH          = 3       # No. of consecutive candles to detect a trend
-ENTRY_PRICE_THRESHOLD    = 0.48    # Max opposite option price to enter
-GALE_1_PRICE_THRESHOLD   = 0.54    # Max price for Gale 1 specifically
-GALE_2_PLUS_PRICE_THRESHOLD = 0.61 # Max price for Gale 2+
+ENTRY_PRICE_THRESHOLD    = 0.45    # Max opposite option price to enter
+GALE_1_PRICE_THRESHOLD   = 0.52    # Max price for Gale 1 specifically
+GALE_2_PLUS_PRICE_THRESHOLD = 0.58 # Max price for Gale 2+
 ENTRY_WINDOW_SECONDS     = 90      # 1st order entry window (seconds)
 MARTINGALE_WINDOW_SECONDS= 180     # Total window for martingale (seconds)
 MARTINGALE_MULTIPLIER    = 2.75    # Each gale = multiplier x previous gale
@@ -34,4 +99,3 @@ MARKET_REFRESH_INTERVAL  = 60      # Tokens change every 5min — refresh often
 
 # --- Copy Trade ---
 COPY_TRADE_POLL_INTERVAL = 1.5     # Seconds between target wallet balance checks
-

@@ -18,9 +18,9 @@ from config import (
     MAX_GALES,
     BASE_TRADE_SIZE_USDC,
     PRICE_POLL_INTERVAL,
-    MARKET_SLUG,
     MARKET_REFRESH_INTERVAL,
     PROFIT_TARGET_PERCENT,
+    MARKETS,
 )
 
 
@@ -82,10 +82,13 @@ class Strategy:
       IN_MARTINGALE → (candle closes) → IDLE
     """
 
-    def __init__(self, poly_client, logger):
-        self.poly  = poly_client
-        self.log   = logger
-        self._lock = threading.RLock()
+    def __init__(self, poly_client, logger, market_key: str = "BTC"):
+        self.poly       = poly_client
+        self.log        = logger   # expected to be a MarketLogger (auto-prefixes all calls)
+        self._lock      = threading.RLock()
+        self.market_key = market_key.upper()
+        market_cfg      = MARKETS.get(self.market_key, {})
+        self._series_id = market_cfg.get("series_id", "")
 
         # State
         self._state: State = State.IDLE
@@ -351,16 +354,18 @@ class Strategy:
     ) -> bool:
         resp = self.poly.buy(token_id, price, size_usdc)
 
-        status = resp.get("status", "")
+        status    = resp.get("status", "")
+        error_msg = str(resp.get("errorMsg", "")).lower()
+
         if resp.get("success") or status in ("live", "matched", "delayed"):
             shares = round(size_usdc / price, 4)
             trade  = Trade(
-                token_id    = token_id,
-                side        = self.target_side,
-                entry_price = price,
-                size_usdc   = size_usdc,
-                shares      = shares,
-                order_id    = resp.get("orderID", ""),
+                token_id     = token_id,
+                side         = self.target_side,
+                entry_price  = price,
+                size_usdc    = size_usdc,
+                shares       = shares,
+                order_id     = resp.get("orderID", ""),
                 condition_id = self.token_ids.get("condition_id", ""),
             )
             if is_gale:
@@ -371,11 +376,20 @@ class Strategy:
                 self.trade_1 = trade
                 self.total_spent = size_usdc
                 self.log.order_placed(trade, is_martingale=False)
-
             return True
-        else:
-            self.log.order_failed(resp)
+
+        # --- Insufficient balance: stop retrying immediately ---
+        if "not enough balance" in error_msg or "balance is not enough" in error_msg:
+            self.log.warn(
+                f"Insufficient balance to place ${size_usdc:.2f} order. "
+                "Another market may have consumed the funds. Returning to IDLE."
+            )
+            self._set_state(State.IDLE)
+            self._reset_context()
             return False
+
+        self.log.order_failed(resp)
+        return False
 
     def _execute_cash_out(self, trade, price):
         exact_shares = self.poly.get_exact_token_balance(trade.token_id)
@@ -409,7 +423,7 @@ class Strategy:
     def _refresh_tokens_if_needed(self, force: bool = False):
         now = synced_time()
         if force or (now - self._last_token_refresh > MARKET_REFRESH_INTERVAL):
-            new_ids = self.poly.fetch_market_tokens()
+            new_ids = self.poly.fetch_market_tokens(series_id=self._series_id)
             if new_ids:
                 with self._lock:
                     self.token_ids = new_ids

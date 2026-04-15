@@ -13,7 +13,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 
 from eth_account import Account
 from dotenv import set_key
-from config import CLOB_HOST, GAMMA_API, CHAIN_ID, MARKET_SLUG, MARKET_SERIES_ID
+from config import CLOB_HOST, GAMMA_API, CHAIN_ID
 
 
 class PolymarketClient:
@@ -377,7 +377,7 @@ class PolymarketClient:
     # Active Market Discovery                                              #
     # ------------------------------------------------------------------ #
 
-    def fetch_market_tokens(self, series_id: str = MARKET_SERIES_ID) -> Dict[str, str]:
+    def fetch_market_tokens(self, series_id: str = "") -> Dict[str, str]:
         """
         Fetches the active btc-updown-5m event using the series ID.
         """
