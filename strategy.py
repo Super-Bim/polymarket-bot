@@ -21,6 +21,9 @@ from config import (
     MARKET_REFRESH_INTERVAL,
     PROFIT_TARGET_PERCENT,
     MARKETS,
+    STOP_LOSS_PERCENT,
+    INDECISION_EXIT_WINDOW_S,
+    INDECISION_PRICE_RANGE,
 )
 
 
@@ -71,15 +74,14 @@ class Strategy:
     State machine for the reversal strategy.
 
     Flow:
-      IDLE → (3 identical candles) → SCANNING
+      IDLE → (sequence of identical candles) → SCANNING
       SCANNING → (price <= 0.40 in 1st 120s) → IN_TRADE_1
       SCANNING → (120s without entry) → IDLE
       IN_TRADE_1 → (profit target hit) → IDLE
-      IN_TRADE_1 → (candle closes against us) → MARTINGALE_WAIT
-      MARTINGALE_WAIT → (same condition in 240s) → IN_MARTINGALE
-      MARTINGALE_WAIT → (240s without entry) → IDLE
-      IN_MARTINGALE → (60% profit target) → IDLE
-      IN_MARTINGALE → (candle closes) → IDLE
+      MARTINGALE_WAIT → (same condition in window) → IN_GALE
+      MARTINGALE_WAIT → (window expires) → IDLE
+      IN_GALE → (profit target hit) → IDLE
+      IN_GALE → (candle closes) → IDLE
     """
 
     def __init__(self, poly_client, logger, market_key: str = "BTC"):
@@ -114,7 +116,6 @@ class Strategy:
 
         # Price polling
         self._last_price_check: float = 0
-        self.total_spent: float = 0.0
         self._prefetch_triggered: bool = False
 
     # ---------------------------------------------------------------- #
@@ -133,7 +134,6 @@ class Strategy:
     # ---------------------------------------------------------------- #
     # BinanceStream Callbacks                                            #
     # ---------------------------------------------------------------- #
-
     def on_sequence_detected(self, direction: str, candles):
         """
         Called when N consecutive candles in same direction are detected.
@@ -197,22 +197,8 @@ class Strategy:
                     return
                 self._try_first_entry(elapsed)
 
-            elif self._state == State.IN_TRADE_1:
-                # Global Take Profit / Cash Out Check (First trade only)
-                if PROFIT_TARGET_PERCENT > 0:
-                    trade = self.trade_1
-                    current_price = self.poly.get_bid_price(trade.token_id)
-                    if current_price > 0.01:
-                        current_value = current_price * trade.shares
-                        profit_pct = ((current_value / trade.size_usdc) - 1.0) * 100
-                        if profit_pct >= PROFIT_TARGET_PERCENT:
-                            self.log.info(f"💰 Global Profit reached! (+{profit_pct:.2f}%). Executing early Cash Out!")
-                            self._execute_cash_out(trade, current_price)
-                            return
-
-            elif self._state == State.IN_GALE:
-                # Early Cash Out is disabled during Martingale to avoid sacrificing recovery stakes.
-                pass
+            elif self._state in (State.IN_TRADE_1, State.IN_GALE):
+                self._check_position_stop_loss(candle.remaining_seconds)
 
             elif self._state == State.MARTINGALE_WAIT:
                 elapsed = now - self.martingale_start
@@ -250,6 +236,10 @@ class Strategy:
                     
                     if is_outcome_win:
                         self.log.win_signal(trade, candle)
+                        
+                        # Win Calculation
+                        win_amt = trade.shares * 1.0
+                        
                         self.poly.register_win_for_settlement(trade, self.total_spent)
                         self._set_state(State.IDLE)
                         self._reset_context()
@@ -408,6 +398,53 @@ class Strategy:
         else:
             self.log.error(f"❌ Early Cash Out failed: {resp.get('errorMsg', resp)}")
 
+    def _check_position_stop_loss(self, remaining_seconds: float):
+        """Monitors open position for profit target, stop loss, or indecision."""
+        is_trade_1 = self._state == State.IN_TRADE_1
+        trade = self.trade_1 if is_trade_1 else (self.gales[-1] if self.gales else None)
+        if not trade: return
+
+        current_bid = self.poly.get_bid_price(trade.token_id)
+        if current_bid <= 0.01: return
+
+        current_value = current_bid * trade.shares
+        pnl_pct = ((current_value / trade.size_usdc) - 1.0) * 100
+
+        # --- Take Profit (Trade 1 only) ---
+        if is_trade_1 and PROFIT_TARGET_PERCENT > 0 and pnl_pct >= PROFIT_TARGET_PERCENT:
+            self.log.success(f"💰 Take Profit hit! (+{pnl_pct:.1f}%). Early Cash Out...")
+            self._execute_cash_out(trade, current_bid)
+            return
+
+        # --- Indecision Exit (Last N seconds) ---
+        if remaining_seconds <= INDECISION_EXIT_WINDOW_S:
+            min_p, max_p = INDECISION_PRICE_RANGE
+            if min_p <= current_bid <= max_p:
+                self.log.warn(f"⚖ Market indecision detected ({current_bid:.3f}) in last {INDECISION_EXIT_WINDOW_S}s. Exiting early to preserve stake.")
+                self._execute_cash_out(trade, current_bid)
+                return
+
+        # --- Stop Loss ---
+        if STOP_LOSS_PERCENT > 0 and pnl_pct <= -STOP_LOSS_PERCENT:
+            self.log.warn(f"🛑 Position Stop Loss hit! ({pnl_pct:.1f}%). Selling...")
+            resp = self.poly.sell(trade.token_id, current_bid, trade.shares)
+            if resp.get("success") or resp.get("status") in ("live", "matched"):
+                self.log.success(f"✅ Stop Loss executed at {current_bid:.3f}.")
+                # Proceed to the next level (Gale) as a normal but controlled loss
+                if is_trade_1:
+                    self.log.info("Proceeding to Martingale Gale 1...")
+                    self.martingale_start = synced_time()
+                    self._set_state(State.MARTINGALE_WAIT)
+                elif self.gale_count < MAX_GALES:
+                    self.log.info(f"Proceeding to Martingale Gale {self.gale_count+1}...")
+                    self.martingale_start = synced_time()
+                    self._set_state(State.MARTINGALE_WAIT)
+                else:
+                    self._set_state(State.IDLE)
+                    self._reset_context()
+            else:
+                self.log.error(f"❌ Stop Loss Sell failed: {resp.get('errorMsg')}")
+
 
     # ---------------------------------------------------------------- #
     # Utilities                                                          #
@@ -446,11 +483,3 @@ class Strategy:
         self.gale_count         = 0
         self.martingale_start   = None
         self.total_spent        = 0.0
-
-        # Whenever returning to IDLE or resetting state
-        # Clear any floating orders to free up margin
-        try:
-            if hasattr(self, 'poly') and self.poly:
-                self.poly.cancel_all_orders()
-        except Exception:
-            pass

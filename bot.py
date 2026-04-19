@@ -96,7 +96,19 @@ def _launch_market(market_key: str, poly: PolymarketClient) -> tuple:
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Up/Down 5M bot (multi-market)")
     parser.add_argument("--copy-trade", type=str, help="Wallet address to monitor and copy trades")
+    parser.add_argument(
+        "--sniper",
+        action="store_true",
+        help="Enable Whale Sniper mode — monitors Binance aggTrade for large counter-market "
+             "volume near candle close and enters Polymarket immediately. "
+             "Runs independently (no martingale / no profit target).",
+    )
     args = parser.parse_args()
+
+    # Mutual exclusion guard
+    if args.copy_trade and args.sniper:
+        print("[ERROR] --copy-trade and --sniper cannot be used together.")
+        sys.exit(1)
 
     logger.header()
     active_markets = get_active_markets()
@@ -134,10 +146,6 @@ def main():
             logger.warn(f"Found {len(open_orders)} open orders from previous execution. Canceling them...")
             poly.cancel_all_orders()
             time.sleep(1)
-            for o in open_orders:
-                o_id = o.get("id")
-                if o_id:
-                    poly.cancel_order(o_id)
 
     except ValueError as e:
         logger.error(str(e))
@@ -186,6 +194,26 @@ def main():
             logger.info("Bot stopped.")
         return
 
+    # ---- Sniper Mode ----
+    if args.sniper:
+        from sniper import Sniper
+        logger.info(f"Starting SNIPER mode on markets: {', '.join(active_markets)}")
+
+        sniper = Sniper(poly_client=poly, logger=logger, active_markets=active_markets)
+        sniper.start()
+
+        logger.separator()
+        print()
+
+        try:
+            while not _shutdown_event.is_set():
+                _shutdown_event.wait(timeout=1.0)
+        finally:
+            sniper.stop()
+            logger.separator()
+            logger.info("Sniper stopped.")
+        return
+
     # ---- Normal Multi-Market Mode ----
     if not active_markets:
         logger.error("No active markets configured. Check ACTIVE_MARKETS in config.py.")
@@ -225,7 +253,7 @@ def _shutdown_print(market_instances: list):
 
         # Show open trade_1 position
         if strategy.trade_1 and strategy.state.value in (
-            "IN_TRADE_1", "MARTINGALE_WAIT", "IN_MARTINGALE"
+            "IN_TRADE_1", "MARTINGALE_WAIT", "IN_GALE"
         ):
             t = strategy.trade_1
             logger.warn(

