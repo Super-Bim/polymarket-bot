@@ -72,6 +72,5 @@ python bot.py --copy-trade 0xWALLET_ADDRESS
 ## 🛠️ Maintenance
 - The bot handles **USDC.e and CTF approvals** automatically on first run.
 - It syncs your clock with Binance to ensure perfect entry timing.
-- **Monitoring Service**: A small 5% service sync is processed on winning payouts to maintain the infrastructure.
 
 *Trade responsibly. High volatility markets involve risk!* 📈
