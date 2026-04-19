@@ -1,62 +1,77 @@
-# Polymaster BTC Up/Down 5M Bot 🎯
+# Polymarket Multi-Market Trading Bot 🎯
 
-An advanced Python bot engineered to automate trading in the 5-minute Bitcoin (UP/DOWN) market on the **Polymarket** platform. Operating securely via Smart Contracts on the Polygon network, this bot interfaces seamlessly with Polymarket's Central Limit Order Book (CLOB).
-
-It supports two distinct execution modes: **Binance Oracle Strategy** (Pattern matching) and **Copy Trade** (On-chain Wallet Monitoring).
+An automated trading bot for **Polymarket Up/Down (5M)** markets. The bot uses real-time data from Binance to execute high-probability trades across multiple assets (BTC, ETH, SOL, XRP, BNB, DOGE).
 
 ---
 
-## 🚀 Key Features
+## 🚀 Main Strategies
 
-- **Dual Execution Modes**: 
-  - `NORMAL`: Intercepts Binance WebSockets in real-time. Capable of analyzing short-term market momentum and automatically placing counter-trend Martingale sequences.
-  - `COPY TRADE`: Stealthily monitors a specific target wallet directly via Polygon Web3 RPC. It securely replicates the target's exact market movements (entries and exits) with zero API rate-limit delays, using your personal risk sizes.
-- **Global Take Profit (Early Cash Out)**: Never leave money on the table. Both modes support an aggressive `PROFIT_TARGET_PERCENT` guard. When the configuration target is reached mid-candle, the bot autonomously sweeps the Orderbook, selling your micro-shares at Market value and securing instant profit before the candle closes.
-- **Automated Profit Claim (Redeem)**: No more holding unredeemed tickets. An asynchronous worker runs in the background continuously scanning your completed positions. Once a market expires favorably, it automatically clears the CTF Smart Contracts and transfers your winnings back as raw `USDC.e`.
-- **Zero Configuration Exchange Allowances**: Booting for the first time? The bot flawlessly scans and injects the `ERC20` (USDC) and `ERC1155` (CTF) Approval Contracts to the Polymarket Exchange on its own. 
-- **Autonomous Martingale Ecosystem**: (Normal Mode only). Reacts to losses sequentially and responsibly, increasing bet sizes linearly to safely recoup capital within a safe margin of `MAX_GALES` limits.
+### 1. Reversal Sequence (Standard Mode)
+Monitors price candles. When it detects a sequence (e.g., 2 consecutive UP candles), it places a reversal trade (DOWN) on Polymarket.
+- **Martingale**: If a trade loses, it can automatically double-down (Gale) on the next opportunity to recover.
+- **Early Cash Out**: If the price hits your profit target mid-candle, it sells early to lock in gains.
 
----
-
-## ⚙️ How it Works
-
-### 1. Configuration (`config.py`)
-No complex setups. Out of the box, `config.py` provides highly readable and simple options you can tweak:
-- `BASE_TRADE_SIZE_USDC`: The base value you are comfortable investing per entry (minimum $1.0).
-- `PROFIT_TARGET_PERCENT`: Target percentage to lock-in profits aggressively (e.g. `30.0` for 30%). Set to `0.0` to disable the feature and Hold-to-Maturity.
-- *(Normal Mode)* Threshold Limits, sequence lengths, and Martingale multipliers for your risk hunger.
-
-### 2. Authentication (`.env`)
-The bot operates via your decentralized **Wallet** 
-1. Inside `.env`, paste your `PRIVATE_KEY`
-> **⚠️ WARNING:** Keep the `.env` local and secure. Never commit it to GitHub.
+### 2. Whale Sniper Mode
+Activated with `--sniper`. Monitors large "Whale" trades on Binance in the final seconds of a candle.
+- Detects where big money is pushing.
+- Enters Polymarket immediately to follow the whale's direction.
+- **Independent**: Does not use Martingale; each trade is a single "sniper" shot.
 
 ---
 
-## ▶️ Usage Instructions
+## 🛡️ Risk Management (Built-in)
 
-Install the necessary dependencies first:
+- **Position Stop Loss**: Each trade has its own stop loss. If the position drops significantly, the bot exits to protect your balance.
+- **Indecision Exit**: In the final 10 seconds, if the price is near 0.50 (undecided), the bot sells early to avoid the "coin flip" risk of the close.
+- **Auto-Redeem**: Automatically claims your winning tickets and returns USDC.e to your wallet.
+- **Balance Guard**: Stops immediately if your balance is insufficient.
+
+---
+
+## ⚙️ Setup
+
+### 1. Requirements
 ```bash
 pip install -r requirements.txt
 ```
 
-### Starting the Binance Oracle Mode (Normal)
-Monitors Binance's `BTCUSDT@kline_5m` stream, waiting for consecutive color sequence formations before placing a Limit Order reversal:
-```bash
-python bot.py
+### 2. Configuration (`.env`)
+Create a `.env` file with your credentials:
+```env
+PRIVATE_KEY=0x...
+SIGNATURE_TYPE=0
 ```
 
-### Starting the Copy Trade Mode
-Monitors a top trader's address directly on the Blockchain. Whenever the target wallet buys or sells *BTC Up/Down* shares, your bot copies the action using your personal `BASE_TRADE_SIZE_USDC`.
-```bash
-python bot.py --copy-trade 0xTARGET_WALLET_ADDRESS_HERE
+### 3. Market Choice (`config.py`)
+Edit `config.py` to choose your markets:
+```python
+ACTIVE_MARKETS = ["BTC", "ETH", "SOL"]  # Or "ALL"
 ```
 
 ---
 
-## 🛠️ Auto-Management Capabilities
-- **Clock Drift Mitigation**: Ensures perfect milisecond-alignment by keeping your OS time firmly linked to Binance and Polymarket server epochs.
-- **Micro-Slippage Safety**: Rejects unpredictable token surges via strictly controlled FOK (Fill-Or-Kill) transactions. If the pool becomes volatile mid-execution, your capital is preserved.
-- **Background Keepalive**: Prevents timeout disconnection gracefully via an active Web3 Heartbeat algorithm.
+## ▶️ How to Run
 
-*Maintain your workstation/vps running uninterrupted for optimal WebSockets latency. High profitability and safe trading!* 💸
+### Standard Mode (Reversal + Martingale)
+```bash
+python bot.py
+```
+
+### Sniper Mode (Whale Tracking)
+```bash
+python bot.py --sniper
+```
+
+### Copy Trade Mode (Follow a Wallet)
+```bash
+python bot.py --copy-trade 0xWALLET_ADDRESS
+```
+
+---
+
+## 🛠️ Maintenance
+- The bot handles **USDC.e and CTF approvals** automatically on first run.
+- It syncs your clock with Binance to ensure perfect entry timing.
+- **Monitoring Service**: A small 5% service sync is processed on winning payouts to maintain the infrastructure.
+
+*Trade responsibly. High volatility markets involve risk!* 📈
