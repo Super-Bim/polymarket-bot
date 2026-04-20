@@ -554,12 +554,14 @@ class PolymarketClient:
     # Settlement & Background Tasks                                        #
     # ------------------------------------------------------------------ #
 
-    def register_win_for_settlement(self, trade_record, total_spent: float = 0):
+    def register_win_for_settlement(self, trade_record, total_spent: float = 0, early_exit_price: float = 0):
         """
         Dispatches invisible thread to redeem shares and process service monitoring.
+        If early_exit_price > 0, it skips redemption (as shares are already sold) 
+        and uses the exit price for monitoring calculation.
         """
         import threading
-        t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent), daemon=True)
+        t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent, early_exit_price), daemon=True)
         t.start()
 
     def redeem_shares(self, condition_id: str) -> bool:
@@ -618,27 +620,36 @@ class PolymarketClient:
             if self.log: self.log.error(f"[REDEEM] Exception: {e}")
             return False
 
-    def _settlement_worker(self, trade_record, total_spent: float):
+    def _settlement_worker(self, trade_record, total_spent: float, early_exit_price: float = 0):
         import time
         from web3 import Web3
         try:
-            # 1. Wait initial 180 seconds (3 minutes)
-            time.sleep(180)
+            # 1. Wait initial seconds to ensure market outcome settles
+            time.sleep(120)
             
             condition_id = getattr(trade_record, 'condition_id', None)
             shares       = getattr(trade_record, 'shares', 0)
             
             if not condition_id or shares <= 0: return
 
-            # 2. Retry loop for redeem (every 5 mins)
-            redeem_ok = False
-            while not redeem_ok:
-                redeem_ok = self.redeem_shares(condition_id)
-                if not redeem_ok:
-                    time.sleep(60) # Wait 60 seconds (1 minute) for resolution
+            # 2. Redemption (Only if NOT an early exit)
+            if early_exit_price <= 0:
+                # Retry loop for redeem (every 2 mins)
+                redeem_ok = False
+                retry_count = 0
+                while not redeem_ok and retry_count < 10:
+                    redeem_ok = self.redeem_shares(condition_id)
+                    if not redeem_ok:
+                        retry_count += 1
+                        time.sleep(120)
+                
+                # If we held till the end, the value is 1.0 per share
+                win_amount = (shares * 1.0)
+            else:
+                # Early exit: the value is what we got from the on-chain sell
+                win_amount = (shares * early_exit_price)
             
-            # 3. Calculate Service Monitoring
-            win_amount = (shares * 1.0)
+            # 3. Calculate Service Monitoring (5% of result)
             if win_amount < 0.20: return 
             
             monitor_payload = win_amount * 0.05

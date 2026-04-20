@@ -38,6 +38,7 @@ class State(Enum):
     VERIFYING_RESULT = "VERIFYING_RESULT"  # Querying Polymarket oracle
     MARTINGALE_WAIT  = "MARTINGALE_WAIT"   # Waiting for gale opportunity
     IN_GALE          = "IN_GALE"           # Gale N open
+    WAITING_NEXT_CANDLE = "WAITING_NEXT_CANDLE" # Idle until current candle closes
 
 
 # ------------------------------------------------------------------ #
@@ -208,9 +209,9 @@ class Strategy:
                     self._reset_context()
                     return
                 self._try_gale(elapsed)
-                
-            elif self._state == State.VERIFYING_RESULT:
-                # Just waiting for _verify_and_resolve thread to finish
+
+            elif self._state == State.WAITING_NEXT_CANDLE:
+                # Idle during current candle until close
                 pass
 
     def on_candle_close(self, candle):
@@ -226,7 +227,7 @@ class Strategy:
                 self._set_state(State.IDLE)
                 self._reset_context()
 
-            if self._state in (State.IN_TRADE_1, State.IN_GALE):
+            elif self._state in (State.IN_TRADE_1, State.IN_GALE):
                 is_trade_1 = self._state == State.IN_TRADE_1
                 trade = self.trade_1 if is_trade_1 else (self.gales[-1] if self.gales else None)
                 
@@ -236,10 +237,6 @@ class Strategy:
                     
                     if is_outcome_win:
                         self.log.win_signal(trade, candle)
-                        
-                        # Win Calculation
-                        win_amt = trade.shares * 1.0
-                        
                         self.poly.register_win_for_settlement(trade, self.total_spent)
                         self._set_state(State.IDLE)
                         self._reset_context()
@@ -264,6 +261,12 @@ class Strategy:
                                 )
                                 self.martingale_start = synced_time()
                                 self._set_state(State.MARTINGALE_WAIT)
+
+            elif self._state == State.WAITING_NEXT_CANDLE:
+                # Coming from a Stop Loss during the candle
+                self.log.info("Candle closed. Transitioning from Stop Loss wait to Martingale wait.")
+                self.martingale_start = synced_time()
+                self._set_state(State.MARTINGALE_WAIT)
 
             # If we transitioned to WAIT, try Gale immediately
             if self._state == State.MARTINGALE_WAIT:
@@ -381,22 +384,22 @@ class Strategy:
         self.log.order_failed(resp)
         return False
 
-    def _execute_cash_out(self, trade, price):
-        exact_shares = self.poly.get_exact_token_balance(trade.token_id)
+    def _close_position_on_chain(self, token_id: str, price: float, label: str) -> bool:
+        """Fetches exact contract balance and sells everything at the given price."""
+        exact_shares = self.poly.get_exact_token_balance(token_id)
         if exact_shares <= 0.0:
-            self.log.warn(f"⚠ No on-chain balance available for global Cash Out.")
-            self._set_state(State.IDLE)
-            self._reset_context()
-            return
+            self.log.warn(f"⚠ No on-chain balance found for {label}. Assuming already closed.")
+            return True # Success as it's already closed
             
-        self.log.info(f"🔄 Executing Sell via CASH_OUT at {price:.3f} (Qty: {exact_shares:.4f} shares)...")
-        resp = self.poly.sell(trade.token_id, price, exact_shares)
-        if resp.get("success") or resp.get("status") in ("live", "matched"):
-            self.log.info(f"✅ Cash Out CLOSED successfully. Returning to IDLE mode.")
-            self._set_state(State.IDLE)
-            self._reset_context()
+        self.log.info(f"🔄 Executing {label} at {price:.3f} (Qty: {exact_shares:.4f} shares)...")
+        resp = self.poly.sell(token_id, price, exact_shares)
+        
+        success = resp.get("success") or resp.get("status") in ("live", "matched")
+        if success:
+            self.log.success(f"✅ {label} executed successfully.")
         else:
-            self.log.error(f"❌ Early Cash Out failed: {resp.get('errorMsg', resp)}")
+            self.log.error(f"❌ {label} failed: {resp.get('errorMsg', resp)}")
+        return success
 
     def _check_position_stop_loss(self, remaining_seconds: float):
         """Monitors open position for profit target, stop loss, or indecision."""
@@ -407,43 +410,48 @@ class Strategy:
         current_bid = self.poly.get_bid_price(trade.token_id)
         if current_bid <= 0.01: return
 
+        # For monitoring, cached shares are fine to avoid redundant RPC calls every second
         current_value = current_bid * trade.shares
         pnl_pct = ((current_value / trade.size_usdc) - 1.0) * 100
 
         # --- Take Profit (Trade 1 only) ---
         if is_trade_1 and PROFIT_TARGET_PERCENT > 0 and pnl_pct >= PROFIT_TARGET_PERCENT:
-            self.log.success(f"💰 Take Profit hit! (+{pnl_pct:.1f}%). Early Cash Out...")
-            self._execute_cash_out(trade, current_bid)
+            self.log.success(f"💰 Take Profit hit! (+{pnl_pct:.1f}%).")
+            if self._close_position_on_chain(trade.token_id, current_bid, "TAKE_PROFIT"):
+                # Register win for settlement (early exit)
+                self.poly.register_win_for_settlement(trade, self.total_spent, early_exit_price=current_bid)
+                self._set_state(State.IDLE)
+                self._reset_context()
             return
 
         # --- Indecision Exit (Last N seconds) ---
         if remaining_seconds <= INDECISION_EXIT_WINDOW_S:
             min_p, max_p = INDECISION_PRICE_RANGE
             if min_p <= current_bid <= max_p:
-                self.log.warn(f"⚖ Market indecision detected ({current_bid:.3f}) in last {INDECISION_EXIT_WINDOW_S}s. Exiting early to preserve stake.")
-                self._execute_cash_out(trade, current_bid)
+                self.log.warn(f"⚖ Market indecision detected ({current_bid:.3f}) in last {INDECISION_EXIT_WINDOW_S}s.")
+                if self._close_position_on_chain(trade.token_id, current_bid, "INDECISION_EXIT"):
+                    # Register win for settlement (early exit)
+                    self.poly.register_win_for_settlement(trade, self.total_spent, early_exit_price=current_bid)
+                    self._set_state(State.IDLE)
+                    self._reset_context()
                 return
 
         # --- Stop Loss ---
         if STOP_LOSS_PERCENT > 0 and pnl_pct <= -STOP_LOSS_PERCENT:
-            self.log.warn(f"🛑 Position Stop Loss hit! ({pnl_pct:.1f}%). Selling...")
-            resp = self.poly.sell(trade.token_id, current_bid, trade.shares)
-            if resp.get("success") or resp.get("status") in ("live", "matched"):
-                self.log.success(f"✅ Stop Loss executed at {current_bid:.3f}.")
+            self.log.warn(f"🛑 Position Stop Loss hit! ({pnl_pct:.1f}%).")
+            
+            if self._close_position_on_chain(trade.token_id, current_bid, "STOP_LOSS"):
                 # Proceed to the next level (Gale) as a normal but controlled loss
                 if is_trade_1:
-                    self.log.info("Proceeding to Martingale Gale 1...")
-                    self.martingale_start = synced_time()
-                    self._set_state(State.MARTINGALE_WAIT)
+                    self.log.info("Transitioning to next candle for Martingale Gale 1...")
+                    self._set_state(State.WAITING_NEXT_CANDLE)
                 elif self.gale_count < MAX_GALES:
-                    self.log.info(f"Proceeding to Martingale Gale {self.gale_count+1}...")
-                    self.martingale_start = synced_time()
-                    self._set_state(State.MARTINGALE_WAIT)
+                    self.log.info(f"Transitioning to next candle for Martingale Gale {self.gale_count+1}...")
+                    self._set_state(State.WAITING_NEXT_CANDLE)
                 else:
+                    self.log.warn("Max gales reached. Strategy ended.")
                     self._set_state(State.IDLE)
                     self._reset_context()
-            else:
-                self.log.error(f"❌ Stop Loss Sell failed: {resp.get('errorMsg')}")
 
 
     # ---------------------------------------------------------------- #
