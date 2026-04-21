@@ -24,6 +24,7 @@ from config import (
     STOP_LOSS_PERCENT,
     INDECISION_EXIT_WINDOW_S,
     INDECISION_PRICE_RANGE,
+    IDLE_AFTER_GALE_LIMIT,
 )
 
 
@@ -39,6 +40,7 @@ class State(Enum):
     MARTINGALE_WAIT  = "MARTINGALE_WAIT"   # Waiting for gale opportunity
     IN_GALE          = "IN_GALE"           # Gale N open
     WAITING_NEXT_CANDLE = "WAITING_NEXT_CANDLE" # Idle until current candle closes
+    WAITING_TREND_RESET = "WAITING_TREND_RESET" # Waiting for opposite candle after loss
 
 
 # ------------------------------------------------------------------ #
@@ -118,6 +120,7 @@ class Strategy:
         # Price polling
         self._last_price_check: float = 0
         self._prefetch_triggered: bool = False
+        self.total_spent: float = 0.0
 
     # ---------------------------------------------------------------- #
     # Public state property                                              #
@@ -145,6 +148,8 @@ class Strategy:
 
         with self._lock:
             if self._state != State.IDLE:
+                if self._state == State.WAITING_TREND_RESET:
+                    self.log.info(f"Ignoring sequence: Waiting for trend {self.sequence_direction} to break.")
                 return
 
             opposite = "DOWN" if direction == "UP" else "UP"
@@ -247,13 +252,26 @@ class Strategy:
                             self.martingale_start = synced_time()
                             self._set_state(State.MARTINGALE_WAIT)
                         else:
+                            # Loss logic - check if we have more gales left
                             if self.gale_count >= MAX_GALES:
-                                self.log.loss_signal(
-                                    f"Gale {self.gale_count} reached MAX LIMIT ({MAX_GALES}). "
-                                    "Ending sequence assuming loss."
-                                )
-                                self._set_state(State.IDLE)
-                                self._reset_context()
+                                if IDLE_AFTER_GALE_LIMIT:
+                                    self.log.warn(
+                                        f"Gale {self.gale_count} reached MAX LIMIT ({MAX_GALES}). "
+                                        f"Entering IDLE MODE: Waiting for trend {self.sequence_direction} to end."
+                                    )
+                                    self._set_state(State.WAITING_TREND_RESET)
+                                    self.trade_1 = None
+                                    self.gales = []
+                                    self.gale_count = 0
+                                    self.martingale_start = None
+                                    self.total_spent = 0.0
+                                else:
+                                    self.log.loss_signal(
+                                        f"Gale {self.gale_count} reached MAX LIMIT ({MAX_GALES}). "
+                                        "Ending sequence assuming loss."
+                                    )
+                                    self._set_state(State.IDLE)
+                                    self._reset_context()
                             else:
                                 self.log.loss_signal(
                                     f"Gale {self.gale_count} lost. "
@@ -261,6 +279,15 @@ class Strategy:
                                 )
                                 self.martingale_start = synced_time()
                                 self._set_state(State.MARTINGALE_WAIT)
+
+            elif self._state == State.WAITING_TREND_RESET:
+                # Check if current candle broke the trend
+                if candle.direction != self.sequence_direction:
+                    self.log.success(f"Trend {self.sequence_direction} broken by {candle.direction} candle. Returning to IDLE.")
+                    self._set_state(State.IDLE)
+                    self._reset_context()
+                else:
+                    self.log.info(f"Trend {self.sequence_direction} continues. Still waiting for break...")
 
             elif self._state == State.WAITING_NEXT_CANDLE:
                 # Coming from a Stop Loss during the candle
@@ -436,8 +463,8 @@ class Strategy:
                     self._reset_context()
                 return
 
-        # --- Stop Loss ---
-        if STOP_LOSS_PERCENT > 0 and pnl_pct <= -STOP_LOSS_PERCENT:
+        # --- Stop Loss (Trade 1 only) ---
+        if is_trade_1 and STOP_LOSS_PERCENT > 0 and pnl_pct <= -STOP_LOSS_PERCENT:
             self.log.warn(f"🛑 Position Stop Loss hit! ({pnl_pct:.1f}%).")
             
             if self._close_position_on_chain(trade.token_id, current_bid, "STOP_LOSS"):
@@ -449,9 +476,19 @@ class Strategy:
                     self.log.info(f"Transitioning to next candle for Martingale Gale {self.gale_count+1}...")
                     self._set_state(State.WAITING_NEXT_CANDLE)
                 else:
-                    self.log.warn("Max gales reached. Strategy ended.")
-                    self._set_state(State.IDLE)
-                    self._reset_context()
+                    if IDLE_AFTER_GALE_LIMIT:
+                        self.log.warn(f"Max gales reached (Stop Loss). Entering IDLE MODE: Waiting for trend {self.sequence_direction} to end.")
+                        self._set_state(State.WAITING_TREND_RESET)
+                        # Clean up but keep sequence_direction
+                        self.trade_1 = None
+                        self.gales = []
+                        self.gale_count = 0
+                        self.martingale_start = None
+                        self.total_spent = 0.0
+                    else:
+                        self.log.warn("Max gales reached. Strategy ended.")
+                        self._set_state(State.IDLE)
+                        self._reset_context()
 
 
     # ---------------------------------------------------------------- #
