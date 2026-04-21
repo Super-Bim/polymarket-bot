@@ -105,6 +105,11 @@ MARTINGALE_MULTIPLIER    = 2.25    # Each gale = multiplier x previous gale
 MAX_GALES                = 2      # Max gales per sequence
 PROFIT_TARGET_PERCENT    = 30    # Overall profit in % for early cash out (both strategies)
 
+# --- Idle Mode (Post-Martingale) ---
+# When enabled, the bot waits for the current strong trend to break 
+# after a max-gale loss before starting new trades.
+IDLE_AFTER_GALE_LIMIT    = True    # Wait for trend reset after a full martingale loss?
+
 # --- Risk Management ---
 STOP_LOSS_PERCENT        = 50    # Stop loss per position
 INDECISION_EXIT_WINDOW_S = 10    # Seconds before close to exit if price is indecisive
