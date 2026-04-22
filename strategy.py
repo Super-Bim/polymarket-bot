@@ -242,7 +242,8 @@ class Strategy:
                     
                     if is_outcome_win:
                         self.log.win_signal(trade, candle)
-                        self.poly.register_win_for_settlement(trade, self.total_spent)
+                        market_label = f"{self.market_key} {trade.side}"
+                        self.poly.register_win_for_settlement(trade, self.total_spent, market=market_label)
                         self._set_state(State.IDLE)
                         self._reset_context()
                     else:
@@ -325,6 +326,8 @@ class Strategy:
             )
             if success:
                 self._set_state(State.IN_TRADE_1)
+                if hasattr(self.poly, "update_max_gale"):
+                    self.poly.update_max_gale(0, self.total_spent)
 
     def _try_gale(self, elapsed: float):
         target_token = self.token_ids.get(self.target_side)
@@ -357,6 +360,8 @@ class Strategy:
             if success:
                 self.gale_count += 1
                 self._set_state(State.IN_GALE)
+                if hasattr(self.poly, "update_max_gale"):
+                    self.poly.update_max_gale(self.gale_count, self.total_spent)
 
     # ---------------------------------------------------------------- #
 
@@ -372,7 +377,8 @@ class Strategy:
         is_gale: bool,
         gale_num: int = 1,
     ) -> bool:
-        resp = self.poly.buy(token_id, price, size_usdc)
+        market_label = f"{self.market_key} {self.target_side}"
+        resp = self.poly.buy(token_id, price, size_usdc, is_martingale=is_gale, market=market_label)
 
         status    = resp.get("status", "")
         error_msg = str(resp.get("errorMsg", "")).lower()
@@ -419,7 +425,8 @@ class Strategy:
             return True # Success as it's already closed
             
         self.log.info(f"🔄 Executing {label} at {price:.3f} (Qty: {exact_shares:.4f} shares)...")
-        resp = self.poly.sell(token_id, price, exact_shares)
+        market_label = f"{self.market_key} {self.target_side}"
+        resp = self.poly.sell(token_id, price, exact_shares, market=market_label)
         
         success = resp.get("success") or resp.get("status") in ("live", "matched")
         if success:
@@ -446,7 +453,8 @@ class Strategy:
             self.log.success(f"💰 Take Profit hit! (+{pnl_pct:.1f}%).")
             if self._close_position_on_chain(trade.token_id, current_bid, "TAKE_PROFIT"):
                 # Register win for settlement (early exit)
-                self.poly.register_win_for_settlement(trade, self.total_spent, early_exit_price=current_bid)
+                market_label = f"{self.market_key} {trade.side}"
+                self.poly.register_win_for_settlement(trade, self.total_spent, early_exit_price=current_bid, market=market_label)
                 self._set_state(State.IDLE)
                 self._reset_context()
             return
@@ -458,7 +466,8 @@ class Strategy:
                 self.log.warn(f"⚖ Market indecision detected ({current_bid:.3f}) in last {INDECISION_EXIT_WINDOW_S}s.")
                 if self._close_position_on_chain(trade.token_id, current_bid, "INDECISION_EXIT"):
                     # Register win for settlement (early exit)
-                    self.poly.register_win_for_settlement(trade, self.total_spent, early_exit_price=current_bid)
+                    market_label = f"{self.market_key} {trade.side}"
+                    self.poly.register_win_for_settlement(trade, self.total_spent, early_exit_price=current_bid, market=market_label)
                     self._set_state(State.IDLE)
                     self._reset_context()
                 return

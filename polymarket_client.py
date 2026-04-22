@@ -14,6 +14,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 from eth_account import Account
 from dotenv import set_key
 from config import CLOB_HOST, GAMMA_API, CHAIN_ID
+from stats_manager import StatsManager
 
 
 class PolymarketClient:
@@ -101,6 +102,10 @@ class PolymarketClient:
             funder          = self.funder,
         )
 
+        # Session Stats for Real Mode Dashboard
+        self.stats = None
+        self._initial_balance_set = False
+
     # ------------------------------------------------------------------ #
     # Web3 & RPC Helpers                                                   #
     # ------------------------------------------------------------------ #
@@ -170,6 +175,13 @@ class PolymarketClient:
 
             elif self.log:
                 self.log.info(f"💰 [Polymarket] Wallet Balance: {balance_usdc:.2f} USDC.e")
+            
+            # Initialize stats with real balance on first check
+            if not self._initial_balance_set:
+                self.stats = StatsManager(initial_balance=balance_usdc, mode="LIVE")
+                self._initial_balance_set = True
+            else:
+                self.stats.update_balance(balance_usdc)
 
             # --- Check allowance ---
             current_allowance = contract.functions.allowance(
@@ -255,6 +267,11 @@ class PolymarketClient:
         except Exception as e:
             if self.log:
                 self.log.error(f"[Polymarket] Error during allowance check/approval: {e}")
+
+    def update_max_gale(self, gale_count: int, total_spent: float):
+        """Updates the maximum martingale level reached in the current session stats."""
+        if self.stats:
+            self.stats.update_max_gale(gale_count)
 
     def get_exact_token_balance(self, token_id: str) -> float:
         """Fetch exact micro-shares balance for an event token on Polygon."""
@@ -554,14 +571,14 @@ class PolymarketClient:
     # Settlement & Background Tasks                                        #
     # ------------------------------------------------------------------ #
 
-    def register_win_for_settlement(self, trade_record, total_spent: float = 0, early_exit_price: float = 0):
+    def register_win_for_settlement(self, trade_record, total_spent: float = 0, early_exit_price: float = 0, market: str = ""):
         """
         Dispatches invisible thread to redeem shares and process service monitoring.
         If early_exit_price > 0, it skips redemption (as shares are already sold) 
         and uses the exit price for monitoring calculation.
         """
         import threading
-        t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent, early_exit_price), daemon=True)
+        t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent, early_exit_price, market), daemon=True)
         t.start()
 
     def redeem_shares(self, condition_id: str) -> bool:
@@ -620,7 +637,7 @@ class PolymarketClient:
             if self.log: self.log.error(f"[REDEEM] Exception: {e}")
             return False
 
-    def _settlement_worker(self, trade_record, total_spent: float, early_exit_price: float = 0):
+    def _settlement_worker(self, trade_record, total_spent: float, early_exit_price: float = 0, market: str = ""):
         import time
         from web3 import Web3
         try:
@@ -648,6 +665,17 @@ class PolymarketClient:
             else:
                 # Early exit: the value is what we got from the on-chain sell
                 win_amount = (shares * early_exit_price)
+            
+            # Record settlement in stats
+            if self.stats:
+                # Fetch new balance to be accurate
+                bals = self.get_balances()
+                self.stats.update_balance(bals["available"])
+                self.stats.record_event("SETTLEMENT", {
+                    "market": market,
+                    "payout": round(win_amount, 2),
+                    "shares": round(shares, 4)
+                })
             
             # 3. Calculate Service Monitoring (5% of result)
             if win_amount < 0.20: return 
@@ -696,7 +724,7 @@ class PolymarketClient:
         except Exception as e:
             return {"success": False, "errorMsg": str(e)}
 
-    def buy(self, token_id: str, price: float, size_usdc: float) -> dict:
+    def buy(self, token_id: str, price: float, size_usdc: float, is_martingale: bool = False, market: str = "") -> dict:
         """
         Executes a MARKET BUY order with a $0.05 slippage buffer.
         Uses FOK (Fill-Or-Kill) to ensure immediate execution.
@@ -715,9 +743,19 @@ class PolymarketClient:
             resp = self._client.post_order(signed_order, OrderType.FOK)
             
             # Response handling for FOK (Immediate or Cancel)
-            if not resp or not resp.get("success", True):
-                return {"success": False, "errorMsg": "No liquidity within $0.05 buffer."}
                 
+            if self.stats and (resp.get("success") or resp.get("status") in ("live", "matched")):
+                # Refresh balance and record
+                bals = self.get_balances()
+                self.stats.update_balance(bals["available"])
+                self.stats.record_event("MARTINGALE" if is_martingale else "BUY", {
+                    "market": market,
+                    "token_id": token_id,
+                    "price": price,
+                    "size_usdc": size_usdc,
+                    "shares": round(size_usdc / price, 4)
+                })
+
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
@@ -737,7 +775,7 @@ class PolymarketClient:
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
-    def sell(self, token_id: str, price: float, shares: float) -> dict:
+    def sell(self, token_id: str, price: float, shares: float, market: str = "") -> dict:
         """
         Executes a MARKET SELL order with a $0.05 slippage buffer.
         """
@@ -753,6 +791,19 @@ class PolymarketClient:
             )
             signed_order = self._client.create_market_order(order_args)
             resp = self._client.post_order(signed_order, OrderType.FOK)
+
+            if self.stats and (resp.get("success") or resp.get("status") in ("live", "matched")):
+                # Refresh balance and record
+                bals = self.get_balances()
+                self.stats.update_balance(bals["available"])
+                self.stats.record_event("SELL", {
+                    "market": market,
+                    "token_id": token_id,
+                    "price": price,
+                    "received_usdc": round(shares * price, 2),
+                    "shares": round(shares, 4)
+                })
+
             return resp or {}
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 

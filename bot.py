@@ -103,6 +103,14 @@ def main():
              "volume near candle close and enters Polymarket immediately. "
              "Runs independently (no martingale / no profit target).",
     )
+    parser.add_argument(
+        "--virtual",
+        type=float,
+        nargs='?',
+        const=1000.0,
+        help="Enable Virtual Mode with an optional initial balance (default: 1000.0). "
+             "Simulates trades without spending real USDC and generates a dashboard.",
+    )
     args = parser.parse_args()
 
     # Mutual exclusion guard
@@ -129,7 +137,11 @@ def main():
     # ---- Shared Polymarket Client ----
     logger.info("Connecting to Polymarket CLOB...")
     try:
-        poly = PolymarketClient(logger=logger)
+        if args.virtual is not None:
+            from virtual_client import VirtualPolymarketClient
+            poly = VirtualPolymarketClient(logger=logger, initial_balance=args.virtual)
+        else:
+            poly = PolymarketClient(logger=logger)
 
         # 1. Verify and Approve USDC.e Allowance
         poly.check_allowance_and_approve()

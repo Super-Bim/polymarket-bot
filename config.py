@@ -96,14 +96,14 @@ def get_active_markets() -> list:
 
 # --- Strategy ---
 SEQUENCE_LENGTH          = 2       # No. of consecutive candles to detect a trend
-ENTRY_PRICE_THRESHOLD    = 0.45    # Max opposite option price to enter
-GALE_1_PRICE_THRESHOLD   = 0.55    # Max price for Gale 1 specifically
-GALE_2_PLUS_PRICE_THRESHOLD = 0.58 # Max price for Gale 2+
+ENTRY_PRICE_THRESHOLD    = 0.48    # Max opposite option price to enter
+GALE_1_PRICE_THRESHOLD   = 0.6    # Max price for Gale 1 specifically
+GALE_2_PLUS_PRICE_THRESHOLD = 0.6 # Max price for Gale 2+
 ENTRY_WINDOW_SECONDS     = 120      # 1st order entry window (seconds)
 MARTINGALE_WINDOW_SECONDS= 180     # Total window for martingale (seconds)
-MARTINGALE_MULTIPLIER    = 2.25    # Each gale = multiplier x previous gale
-MAX_GALES                = 2      # Max gales per sequence
-PROFIT_TARGET_PERCENT    = 30    # Overall profit in % for early cash out (both strategies)
+MARTINGALE_MULTIPLIER    = 2.5    # Each gale = multiplier x previous gale
+MAX_GALES                = 20      # Max gales per sequence
+PROFIT_TARGET_PERCENT    = 150    # Overall profit in % for early cash out (both strategies)
 
 # --- Idle Mode (Post-Martingale) ---
 # When enabled, the bot waits for the current strong trend to break 
@@ -111,9 +111,9 @@ PROFIT_TARGET_PERCENT    = 30    # Overall profit in % for early cash out (both 
 IDLE_AFTER_GALE_LIMIT    = True    # Wait for trend reset after a full martingale loss?
 
 # --- Risk Management ---
-STOP_LOSS_PERCENT        = 50    # Stop loss per position
-INDECISION_EXIT_WINDOW_S = 10    # Seconds before close to exit if price is indecisive
-INDECISION_PRICE_RANGE   = (0.42, 0.58) # Price range considered "indecisive"
+STOP_LOSS_PERCENT        = 40    # Stop loss per position
+INDECISION_EXIT_WINDOW_S = 5    # Seconds before close to exit if price is indecisive
+INDECISION_PRICE_RANGE   = (0.47, 0.54) # Price range considered "indecisive"
 
 # --- Sizing ---
 BASE_TRADE_SIZE_USDC     = 1     # Base trade size ($1 minimum)
