@@ -15,62 +15,74 @@ Monitors price candles. When it detects a sequence (e.g., 2 consecutive UP candl
 Activated with `--sniper`. Monitors large "Whale" trades on Binance in the final seconds of a candle.
 - Detects where big money is pushing.
 - Enters Polymarket immediately to follow the whale's direction.
-- **Independent**: Does not use Martingale; each trade is a single "sniper" shot.
+
+### 3. Copy Trade Mode
+Activated with `--copy-trade [WALLET]`. Follows the moves of a target wallet in real-time.
 
 ---
 
-## 🛡️ Risk Management (Built-in)
+## 📊 Live Dashboard & Monitoring
 
-- **Position Stop Loss**: Each trade has its own stop loss. If the position drops significantly, the bot exits to protect your balance.
-- **Indecision Exit**: In the final 10 seconds, if the price is near 0.50 (undecided), the bot sells early to avoid the "coin flip" risk of the close.
-- **Auto-Redeem**: Automatically claims your winning tickets and returns USDC.e to your wallet.
-- **Balance Guard**: Stops immediately if your balance is insufficient.
+The bot generates a premium HTML dashboard (`live_dashboard.html` or `virtual_dashboard.html`) that allows you to monitor your performance in real-time:
+
+- **Auto-Refresh**: The page updates automatically every 15 seconds.
+- **Detailed Tracking**: The trade history table shows the specific asset (e.g., `BTC UP`) and distinguishes between normal entries and Martingale (Gale) recovery trades.
+- **Visual Charts**: Live equity curve showing your balance evolution.
 
 ---
 
-## ⚙️ Setup
+## ⚙️ Setup & Installation
 
-### 1. Requirements
+### 1. Install Dependencies
+Ensure you have Python 3.10+ installed. Run the following command to install required libraries:
 ```bash
 pip install -r requirements.txt
 ```
 
 ### 2. Configuration (`.env`)
-Create a `.env` file with your credentials:
+Create a `.env` file in the root folder with your credentials:
 ```env
-PRIVATE_KEY=0x...
-SIGNATURE_TYPE=0
+PRIVATE_KEY=0xYOUR_PRIVATE_KEY
+SIGNATURE_TYPE=0  # 0 for EOA, 2 for Proxy/Email wallets
 ```
+*Note: The bot will automatically generate and save your Polymarket API keys to this file on the first run.*
 
 ### 3. Market Choice (`config.py`)
-Edit `config.py` to choose your markets:
+You can choose which assets to trade by editing the `ACTIVE_MARKETS` list:
 ```python
-ACTIVE_MARKETS = ["BTC", "ETH", "SOL"]  # Or "ALL"
+ACTIVE_MARKETS = ["BTC", "ETH", "SOL"]  # Or "ALL" to trade everything
 ```
 
 ---
 
-## ▶️ How to Run
+## ▶️ Usage
 
-### Standard Mode (Reversal + Martingale)
+### Running in Virtual Mode (Simulation)
+Test your settings with virtual money:
+```bash
+python bot.py --virtual 1000
+```
+
+### Running in Real Mode (Real Money)
 ```bash
 python bot.py
 ```
 
-### Sniper Mode (Whale Tracking)
+### Running the Sniper
 ```bash
 python bot.py --sniper
 ```
 
-### Copy Trade Mode (Follow a Wallet)
+### Running Copy Trade
 ```bash
-python bot.py --copy-trade 0xWALLET_ADDRESS
+python bot.py --copy-trade 0x123...
 ```
 
 ---
 
-## 🛠️ Maintenance
-- The bot handles **USDC.e and CTF approvals** automatically on first run.
-- It syncs your clock with Binance to ensure perfect entry timing.
+## 🛡️ Risk Management
+- **Automatic Approvals**: Handles USDC.e and CTF contract approvals on first use.
+- **Clock Sync**: Automatically synchronizes with Binance server time for precise entries.
+- **Stop Loss & Indecision Exit**: Built-in mechanisms to exit risky positions before the candle close.
 
 *Trade responsibly. High volatility markets involve risk!* 📈
