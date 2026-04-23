@@ -43,7 +43,7 @@ pip install -r requirements.txt
 Create a `.env` file in the root folder with your credentials:
 ```env
 PRIVATE_KEY=0xYOUR_PRIVATE_KEY
-SIGNATURE_TYPE=0  # 0 for EOA, 2 for Proxy/Email wallets
+SIGNATURE_TYPE=0 
 ```
 *Note: The bot will automatically generate and save your Polymarket API keys to this file on the first run.*
 
