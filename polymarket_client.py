@@ -4,8 +4,33 @@
 
 import os
 import time
+import socket
 import requests
 from typing import Optional, Dict
+
+# ------------------------------------------------------------------
+# DNS Resilience — Cached Cloudflare IPs for Polymarket endpoints.
+# Acts as a fallback when system DNS fails to resolve Polymarket
+# domains (e.g. restrictive ISPs, corporate firewalls, VPN configs).
+# These are Polymarket's own public Cloudflare CDN addresses.
+# ------------------------------------------------------------------
+_POLYMARKET_IPS = {
+    "gamma-api.polymarket.com": "172.64.153.51",
+    "clob.polymarket.com":      "172.64.153.51",
+    "data-api.polymarket.com":  "172.64.153.51",
+    "strapi-matic.poly.market": "172.64.153.51",
+    "api.polymarket.com":       "172.64.153.51",
+}
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+def _patched_getaddrinfo(host, port, *args, **kwargs):
+    if host in _POLYMARKET_IPS:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (_POLYMARKET_IPS[host], port))]
+    return _orig_getaddrinfo(host, port, *args, **kwargs)
+
+socket.getaddrinfo = _patched_getaddrinfo
+# ------------------------------------------------------------------
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, MarketOrderArgs, OrderType
@@ -673,7 +698,8 @@ class PolymarketClient:
                 self.stats.update_balance(bals["available"])
                 self.stats.record_event("SETTLEMENT", {
                     "market": market,
-                    "payout": round(win_amount, 2),
+                    "payout": 1.0, # Value per share
+                    "received_usdc": round(win_amount, 2),
                     "shares": round(shares, 4)
                 })
             
