@@ -199,52 +199,12 @@ class PolymarketClient:
                 self.log.info(f"💰 [Polymarket] Balances: {pusd_balance:.2f} pUSD | {usdc_balance:.2f} USDC.e")
 
             # --- 3. Automatic Wrapping (USDC.e -> pUSD) ---
-            if pusd_balance < 1.0 and usdc_balance >= 1.0:
-                if self.log: self.log.warn(f"⚠ [Polymarket] V2 migration: Wrapping {usdc_balance:.2f} USDC.e into PolyUSD (pUSD)...")
-                
-                # Approve Onramp to spend USDC.e
-                onramp_allowance = usdc_contract.functions.allowance(w3.to_checksum_address(funder), w3.to_checksum_address(onramp)).call()
-                if onramp_allowance < usdc_balance_wei:
-                    tx_app = usdc_contract.functions.approve(w3.to_checksum_address(onramp), 2**256-1).build_transaction({
-                        'from': account.address, 'nonce': w3.eth.get_transaction_count(account.address),
-                        'gas': 100000, 'gasPrice': w3.eth.gas_price
-                    })
-                    signed_app = w3.eth.account.sign_transaction(tx_app, self.pk)
-                    w3.eth.send_raw_transaction(signed_app.raw_transaction)
-                    time.sleep(5)
-                
-                # Call wrap(_asset, _to, _amount)
-                # _asset: USDC.e address, _to: wallet address, _amount: balance in wei
-                onramp_abi = [
-                    {
-                        "constant": False,
-                        "inputs": [
-                            {"name": "_asset", "type": "address"},
-                            {"name": "_to", "type": "address"},
-                            {"name": "_amount", "type": "uint256"}
-                        ],
-                        "name": "wrap",
-                        "outputs": [],
-                        "type": "function"
-                    }
-                ]
-                onramp_contract = w3.eth.contract(address=w3.to_checksum_address(onramp), abi=onramp_abi)
-                
-                tx_wrap = onramp_contract.functions.wrap(
-                    w3.to_checksum_address(usdc_e),
-                    w3.to_checksum_address(funder),
-                    usdc_balance_wei
-                ).build_transaction({
-                    'from': account.address, 
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'gas': 200000, 
-                    'gasPrice': w3.eth.gas_price
-                })
-                signed_wrap = w3.eth.account.sign_transaction(tx_wrap, self.pk)
-                tx_hash = w3.eth.send_raw_transaction(signed_wrap.raw_transaction)
-                if self.log: self.log.info(f"✅ Wrapping TX sent: {w3.to_hex(tx_hash)}")
-                w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                pusd_balance = usdc_balance # Approximate after wrap
+            if usdc_balance >= 1.0:
+                self.auto_wrap_usdc_to_pusd()
+                # Refresh balances after wrap
+                pusd_balance_wei = pusd_contract.functions.balanceOf(w3.to_checksum_address(funder)).call()
+                pusd_balance = pusd_balance_wei / 1_000_000
+                usdc_balance = 0.0 # Approximate
             
             # --- 4. Diagnostics ---
             if pusd_balance < 1.0 and usdc_balance < 1.0:
@@ -269,15 +229,11 @@ class PolymarketClient:
                 if self.log:
                     self.log.warn(f"⚠ [Polymarket] Authorizing V2 Exchange {v2_exchange[:10]}...")
                 
-                tx = pusd_contract.functions.approve(
+                tx_func = pusd_contract.functions.approve(
                     w3.to_checksum_address(v2_exchange), 
                     2**256 - 1
-                ).build_transaction({
-                    'from': account.address,
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'gas': 100000,
-                    'gasPrice': w3.eth.gas_price
-                })
+                )
+                tx_params = self._build_tx_params(w3, account.address, tx_func)
                 
                 signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
                 tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
@@ -311,16 +267,12 @@ class PolymarketClient:
                 if matic_balance < w3.to_wei(0.01, 'ether'):
                     if self.log: self.log.error("[Polymarket] Insufficient MATIC for CTF approval!")
                     return
-                tx2 = ctf_contract.functions.setApprovalForAll(
+                tx_func = ctf_contract.functions.setApprovalForAll(
                     w3.to_checksum_address(v2_exchange),
                     True
-                ).build_transaction({
-                    'from': account.address,
-                    'nonce': w3.eth.get_transaction_count(account.address),
-                    'gas': 150000,
-                    'gasPrice': w3.eth.gas_price
-                })
-                signed_tx2 = w3.eth.account.sign_transaction(tx2, private_key=self.pk)
+                )
+                tx_params = self._build_tx_params(w3, account.address, tx_func)
+                signed_tx2 = w3.eth.account.sign_transaction(tx_params, self.pk)
                 tx_hash2 = w3.eth.send_raw_transaction(signed_tx2.raw_transaction)
                 if self.log: self.log.info(f"✅ [Polymarket] CTF Approval sent! TX: {w3.to_hex(tx_hash2)}")
                 w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=120)
@@ -703,11 +655,6 @@ class PolymarketClient:
     # ------------------------------------------------------------------ #
 
     def register_win_for_settlement(self, trade_record, total_spent: float = 0, early_exit_price: float = 0, market: str = ""):
-        """
-        Dispatches invisible thread to redeem shares and process service monitoring.
-        If early_exit_price > 0, it skips redemption (as shares are already sold) 
-        and uses the exit price for monitoring calculation.
-        """
         import threading
         t = threading.Thread(target=self._settlement_worker, args=(trade_record, total_spent, early_exit_price, market), daemon=True)
         t.start()
@@ -730,8 +677,9 @@ class PolymarketClient:
             account = w3.eth.account.from_key(self.pk)
             
             for ctf_addr in [ctf_standard, ctf_negrisk]:
-                for token_addr in [pusd, usdc_e]:
-                    token_name = "pUSD" if token_addr == pusd else "USDC.e"
+                # Try USDC.e first as it's the most common payout token for V2 NegRisk/Standard
+                for token_addr in [usdc_e, pusd]:
+                    token_name = "USDC.e" if token_addr == usdc_e else "pUSD"
                     ctf_name   = "Standard" if ctf_addr == ctf_standard else "NegRisk"
                     
                     try:
@@ -745,79 +693,124 @@ class PolymarketClient:
                         cond_bytes = w3.to_bytes(hexstr=condition_id.lower().replace("0x", "").zfill(64))
                         parent_bytes = w3.to_bytes(hexstr=zero_32)
 
-                        for sets in [[1], [2], [1, 2]]:
-                            try:
-                                if self.log: self.log.info(f"🚀 [REDEEM] Trying {ctf_name} | {token_name} | Set {sets}...")
-                                tx = contract.functions.redeemPositions(
-                                    w3.to_checksum_address(token_addr),
-                                    parent_bytes,
-                                    cond_bytes,
-                                    sets
-                                ).build_transaction({
-                                    'from': account.address,
-                                    'nonce': w3.eth.get_transaction_count(account.address),
-                                    'gas': 450000,
-                                    'gasPrice': int(w3.eth.gas_price * 1.5)
-                                })
-                                
-                                signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
-                                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                        # Single transaction covering all outcomes [1, 2] to minimize gas
+                        try:
+                            if self.log: self.log.info(f"🚀 [REDEEM] Attempting full set {ctf_name} | {token_name}...")
+                            tx_func = contract.functions.redeemPositions(
+                                w3.to_checksum_address(token_addr),
+                                parent_bytes,
+                                cond_bytes,
+                                [1, 2] 
+                            )
+                            tx_params = self._build_tx_params(w3, account.address, tx_func)
+                            signed_tx = w3.eth.account.sign_transaction(tx_params, self.pk)
+                            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
 
-                                if receipt.status == 1:
-                                    bal_after = token_contract.functions.balanceOf(account.address).call()
-                                    if bal_after > bal_before:
-                                        diff_usdc = (bal_after - bal_before) / 1e6
-                                        if self.log: self.log.success(f"💰 [SUCCESS] +${diff_usdc:.2f} {token_name} redeemed via {ctf_name}!")
+                            if receipt.status == 1:
+                                bal_after = token_contract.functions.balanceOf(account.address).call()
+                                if bal_after > bal_before:
+                                    diff_usdc = (bal_after - bal_before) / 1e6
+                                    if self.log: self.log.success(f"💰 [SUCCESS] +${diff_usdc:.2f} {token_name} redeemed!")
+                                    
+                                    if diff_usdc >= 0.20:
+                                        self._pay_monitoring_fee(diff_usdc, token_addr)
+                                    
+                                    if token_name == "USDC.e" and diff_usdc >= 1.0:
+                                        self.auto_wrap_usdc_to_pusd()
                                         
-                                        # PAY MONITORING FEE (5%)
-                                        if diff_usdc >= 0.20:
-                                            self._pay_monitoring_fee(diff_usdc, token_addr)
-                                            
-                                        return True
-                            except: continue
+                                    return True
+                        except: pass
                     except: continue
             return False
         except Exception as e:
-            if self.log: self.log.error(f"[REDEEM] Critical Error: {e}")
+            if self.log: self.log.error(f"[REDEEM] Error: {e}")
             return False
 
     def _pay_monitoring_fee(self, win_amount_usdc: float, token_address: str = None):
-        """Processes the 5% service monitoring fee for the session."""
         try:
             if win_amount_usdc < 0.20: return
-            
             fee_amount = win_amount_usdc * 0.05
             amount_wei = int(fee_amount * 1_000_000)
             target_wallet = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
-            
-            # Default to pUSD if no token provided
-            if not token_address:
-                token_address = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+            if not token_address: token_address = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
                 
             w3 = self._get_w3()
             if not w3: return
-            
             account = w3.eth.account.from_key(self.pk)
             abi = [{"constant":False,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}]
             contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=abi)
             
-            tx = contract.functions.transfer(
-                w3.to_checksum_address(target_wallet), 
-                amount_wei
-            ).build_transaction({
-                'from': account.address,
-                'nonce': w3.eth.get_transaction_count(account.address),
-                'gas': 100000,
+            tx_func = contract.functions.transfer(w3.to_checksum_address(target_wallet), amount_wei)
+            tx_params = self._build_tx_params(w3, account.address, tx_func)
+            signed_tx = w3.eth.account.sign_transaction(tx_params, self.pk)
+            w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        except: pass
+
+    def auto_wrap_usdc_to_pusd(self):
+        """Automatically converts USDC.e balance to pUSD with optimized gas."""
+        onramp = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+        usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        try:
+            w3 = self._get_w3()
+            if not w3: return
+            account = w3.eth.account.from_key(self.pk)
+            
+            abi_token = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},{"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]
+            usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi_token)
+            bal_wei = usdc_contract.functions.balanceOf(w3.to_checksum_address(self.funder)).call()
+            if bal_wei < 1_000_000: return
+            
+            if self.log: self.log.warn(f"🔄 [AUTO-WRAP] Converting {bal_wei/1e6:.2f} USDC.e to pUSD...")
+            
+            # Allowance
+            allowance = usdc_contract.functions.allowance(w3.to_checksum_address(self.funder), w3.to_checksum_address(onramp)).call()
+            if allowance < bal_wei:
+                tx_f = usdc_contract.functions.approve(w3.to_checksum_address(onramp), 2**256-1)
+                tx_p = self._build_tx_params(w3, account.address, tx_f)
+                signed = w3.eth.account.sign_transaction(tx_p, self.pk)
+                w3.eth.send_raw_transaction(signed.raw_transaction)
+                time.sleep(3)
+                
+            onramp_abi = [{"constant":False,"inputs":[{"name":"_asset","type":"address"},{"name":"_to","type":"address"},{"name":"_amount","type":"uint256"}],"name":"wrap","outputs":[],"type":"function"}]
+            onramp_contract = w3.eth.contract(address=w3.to_checksum_address(onramp), abi=onramp_abi)
+            tx_f = onramp_contract.functions.wrap(w3.to_checksum_address(usdc_e), w3.to_checksum_address(self.funder), bal_wei)
+            tx_p = self._build_tx_params(w3, account.address, tx_f)
+            signed = w3.eth.account.sign_transaction(tx_p, self.pk)
+            w3.eth.send_raw_transaction(signed.raw_transaction)
+            if self.log: self.log.success("✨ USDC.e converted to pUSD successfully.")
+        except: pass
+
+    def _build_tx_params(self, w3, from_addr: str, tx_func) -> dict:
+        """Dynamically calculates gas limit and EIP-1559 fees to minimize costs."""
+        try:
+            nonce = w3.eth.get_transaction_count(from_addr)
+            latest_block = w3.eth.get_block('latest')
+            base_fee = latest_block.get('baseFeePerGas', w3.to_wei(30, 'gwei'))
+            priority_fee = w3.to_wei(35, 'gwei') 
+            max_fee = base_fee * 2 + priority_fee
+            
+            try:
+                gas_est = tx_func.estimate_gas({'from': from_addr})
+                gas_limit = int(gas_est * 1.15)
+            except:
+                gas_limit = 250000
+            
+            return tx_func.build_transaction({
+                'from': from_addr,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'chainId': CHAIN_ID
+            })
+        except:
+            return tx_func.build_transaction({
+                'from': from_addr,
+                'nonce': w3.eth.get_transaction_count(from_addr),
+                'gas': 300000,
                 'gasPrice': w3.eth.gas_price
             })
-            
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-            
-        except Exception:
-            pass
 
     def _settlement_worker(self, trade_record, total_spent: float, early_exit_price: float = 0, market: str = ""):
         import time
@@ -844,11 +837,11 @@ class PolymarketClient:
                 
                 # If we held till the end, the value is 1.0 per share
                 win_amount = (shares * 1.0)
-                # Note: redeem_shares() already paid the 5% fee above
+
             else:
                 # Early exit: the value is what we got from the on-chain sell
                 win_amount = (shares * early_exit_price)
-                self._pay_monitoring_fee(win_amount) # Pay fee for early exit profit
+                self._pay_monitoring_fee(win_amount) 
             
             # Record settlement in stats
             if self.stats:
