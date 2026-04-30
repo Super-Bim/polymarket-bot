@@ -185,8 +185,8 @@ class Strategy:
                 return
             self._last_price_check = now
 
-            # Heartbeat to keep session alive
-            self._heartbeat_id = self.poly.send_heartbeat(self._heartbeat_id)
+            # Heartbeat (Disabled in V2 to avoid Invalid Heartbeat ID noise)
+            # self._heartbeat_id = self.poly.send_heartbeat(self._heartbeat_id)
 
             # --- TOKEN PRE-FETCH (15s before close) ---
             # To avoid 1s latency on Gamma API call during close

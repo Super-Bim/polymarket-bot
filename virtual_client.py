@@ -29,9 +29,14 @@ class VirtualPolymarketClient(PolymarketClient):
         from config import CLOB_HOST, GAMMA_API
         self.host = CLOB_HOST
         self.gamma_api = GAMMA_API
+        self._price_cache = {}
         
         if self.log:
             self.log.info(f"Initialized Virtual Mode with ${initial_balance:.2f} balance.")
+
+    def check_is_winner(self, token_id: str, timeout_seconds: int = 15) -> bool:
+        """Simulates winning check (always returns True in simulation context)."""
+        return True
 
     def check_allowance_and_approve(self, amount_usdc: float = 1000000.0):
         if self.log: self.log.info("Virtual Mode: Skipping allowance checks.")

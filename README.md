@@ -78,6 +78,14 @@ python bot.py --sniper
 python bot.py --copy-trade 0x123...
 ```
 
+### Emergency Rescue Mode
+If you have unclaimed winnings or stuck orders from previous sessions:
+```bash
+python bot.py --rescue
+```
+- **Force Redemption**: Scans your entire history for unclaimed winnings and claims them (pUSD or USDC.e).
+- **Clear Orders**: Cancels all open and conditional orders to free up your collateral.
+
 ---
 
 ## 🛡️ Risk Management
