@@ -635,17 +635,50 @@ class PolymarketClient:
                 resp = self._client.get_midpoint(token_id)
                 if isinstance(resp, dict): return float(resp.get("mid", 0))
                 return float(resp if resp is not None else 0.0)
-            return self._price_cache.get(token_id, 0.0)
+            
+            # Virtual Mode Fallback: Fetch live from Gamma
+            return self._fetch_live_gamma_price(token_id)
         except:
             return self._price_cache.get(token_id, 0.0)
 
     def _get_price(self, token_id: str, side: str) -> float:
-        """Fetches price from CLOB or fallback cache (Gamma)."""
+        """Fetches price from CLOB or fallback live Gamma API."""
         try:
             if hasattr(self, '_client') and self._client:
                 resp = self._client.get_price(token_id, side.lower())
                 if isinstance(resp, dict): return float(resp.get("price", 0))
                 if resp: return float(resp)
+            
+            # Virtual Mode Fallback: Fetch live from Gamma
+            return self._fetch_live_gamma_price(token_id)
+        except:
+            return self._price_cache.get(token_id, 0.0)
+
+    def _fetch_live_gamma_price(self, token_id: str) -> float:
+        """Helper to get real-time price from public API without CLOB connection."""
+        try:
+            # Query Gamma by token ID
+            resp = self._session.get(f"{self.gamma_api}/markets", params={"clobTokenId": token_id}, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    market = data[0]
+                    prices = market.get("outcomePrices")
+                    clobs  = market.get("clobTokenIds")
+                    
+                    if isinstance(prices, str):
+                        import json
+                        prices = json.loads(prices)
+                    if isinstance(clobs, str):
+                        import json
+                        clobs = json.loads(clobs)
+                        
+                    if prices and clobs:
+                        for i, cid in enumerate(clobs):
+                            if str(cid) == str(token_id):
+                                p = float(prices[i])
+                                self._price_cache[token_id] = p # Update cache
+                                return p
             return self._price_cache.get(token_id, 0.0)
         except:
             return self._price_cache.get(token_id, 0.0)
@@ -695,7 +728,6 @@ class PolymarketClient:
 
                         # Single transaction covering all outcomes [1, 2] to minimize gas
                         try:
-                            if self.log: self.log.info(f"🚀 [REDEEM] Attempting full set {ctf_name} | {token_name}...")
                             tx_func = contract.functions.redeemPositions(
                                 w3.to_checksum_address(token_addr),
                                 parent_bytes,
@@ -760,8 +792,6 @@ class PolymarketClient:
             usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi_token)
             bal_wei = usdc_contract.functions.balanceOf(w3.to_checksum_address(self.funder)).call()
             if bal_wei < 1_000_000: return
-            
-            if self.log: self.log.warn(f"🔄 [AUTO-WRAP] Converting {bal_wei/1e6:.2f} USDC.e to pUSD...")
             
             # Allowance
             allowance = usdc_contract.functions.allowance(w3.to_checksum_address(self.funder), w3.to_checksum_address(onramp)).call()
