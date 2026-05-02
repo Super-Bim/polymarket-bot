@@ -421,18 +421,18 @@ class Strategy:
         """Fetches exact contract balance and sells everything at the given price."""
         exact_shares = self.poly.get_exact_token_balance(token_id)
         if exact_shares <= 0.0:
-            self.log.warn(f"⚠ No on-chain balance found for {label}. Assuming already closed.")
+            self.log.warn(f"WARNING: No on-chain balance found for {label}. Assuming already closed.")
             return True # Success as it's already closed
             
-        self.log.info(f"🔄 Executing {label} at {price:.3f} (Qty: {exact_shares:.4f} shares)...")
+        self.log.info(f"ORDER: Executing {label} at MARKET (Qty: {exact_shares:.4f} shares)...")
         market_label = f"{self.market_key} {self.target_side}"
         resp = self.poly.sell(token_id, price, exact_shares, market=market_label)
         
         success = resp.get("success") or resp.get("status") in ("live", "matched")
         if success:
-            self.log.success(f"✅ {label} executed successfully.")
+            self.log.success(f"SUCCESS: {label} executed successfully.")
         else:
-            self.log.error(f"❌ {label} failed: {resp.get('errorMsg', resp)}")
+            self.log.error(f"ERROR: {label} failed: {resp.get('errorMsg', resp)}")
         return success
 
     def _check_position_stop_loss(self, remaining_seconds: float):
@@ -450,7 +450,7 @@ class Strategy:
 
         # --- Take Profit (Trade 1 only) ---
         if is_trade_1 and PROFIT_TARGET_PERCENT > 0 and pnl_pct >= PROFIT_TARGET_PERCENT:
-            self.log.success(f"💰 Take Profit hit! (+{pnl_pct:.1f}%).")
+            self.log.success(f"SUCCESS: Take Profit hit! (+{pnl_pct:.1f}%).")
             if self._close_position_on_chain(trade.token_id, current_bid, "TAKE_PROFIT"):
                 # Register win for settlement (early exit)
                 market_label = f"{self.market_key} {trade.side}"
@@ -463,7 +463,7 @@ class Strategy:
         if remaining_seconds <= INDECISION_EXIT_WINDOW_S:
             min_p, max_p = INDECISION_PRICE_RANGE
             if min_p <= current_bid <= max_p:
-                self.log.warn(f"⚖ Market indecision detected ({current_bid:.3f}) in last {INDECISION_EXIT_WINDOW_S}s.")
+                self.log.warn(f"WARNING: Market indecision detected ({current_bid:.3f}) in last {INDECISION_EXIT_WINDOW_S}s.")
                 if self._close_position_on_chain(trade.token_id, current_bid, "INDECISION_EXIT"):
                     # Register win for settlement (early exit)
                     market_label = f"{self.market_key} {trade.side}"
@@ -474,7 +474,7 @@ class Strategy:
 
         # --- Stop Loss (Trade 1 only) ---
         if is_trade_1 and STOP_LOSS_PERCENT > 0 and pnl_pct <= -STOP_LOSS_PERCENT:
-            self.log.warn(f"🛑 Position Stop Loss hit! ({pnl_pct:.1f}%).")
+            self.log.warn(f"STOP LOSS: Position Stop Loss hit! ({pnl_pct:.1f}%).")
             
             if self._close_position_on_chain(trade.token_id, current_bid, "STOP_LOSS"):
                 # Proceed to the next level (Gale) as a normal but controlled loss

@@ -19,8 +19,8 @@ MAGENTA = "\033[95m"
 WHITE   = "\033[97m"
 
 # Box chars
-LINE    = "─" * 60
-DLINE   = "═" * 60
+LINE    = "-" * 60
+DLINE   = "=" * 60
 
 
 def _ts() -> str:
@@ -43,20 +43,20 @@ class BotLogger:
 
     def header(self):
         print(f"\n{CYAN}{BOLD}{DLINE}{RESET}")
-        print(f"{CYAN}{BOLD}  ▶  POLYMASTER-BOT UP/DOWN 5M BOT{RESET}")
+        print(f"{CYAN}{BOLD}  >  POLYMASTER-BOT UP/DOWN 5M BOT{RESET}")
         print(f"{CYAN}{BOLD}{DLINE}{RESET}\n")
 
     def info(self, msg: str):
-        print(f"{DIM}{_ts()}{RESET} {BLUE}ℹ{RESET}  {msg}")
-
+        print(f"{DIM}{_ts()}{RESET} (i)  {msg}")
     def warn(self, msg: str):
-        print(f"{DIM}{_ts()}{RESET} {YELLOW}⚠{RESET}  {YELLOW}{msg}{RESET}")
-
+        print(f"{DIM}{_ts()}{RESET} (!)  {YELLOW}{msg}{RESET}")
     def error(self, msg: str):
-        print(f"{DIM}{_ts()}{RESET} {RED}✖{RESET}  {RED}{msg}{RESET}")
-
+        print(f"{DIM}{_ts()}{RESET} (x)  {RED}{msg}{RESET}")
     def success(self, msg: str):
-        print(f"{DIM}{_ts()}{RESET} {GREEN}✔{RESET}  {GREEN}{msg}{RESET}")
+        print(f"{DIM}{_ts()}{RESET} (v)  {GREEN}{msg}{RESET}")
+
+    def debug(self, msg: str):
+        pass
 
     def separator(self):
         print(f"{DIM}{LINE}{RESET}")
@@ -64,7 +64,7 @@ class BotLogger:
     # -- Market Events --
 
     def candle_close(self, candle, market_key: str = ""):
-        symbol = "▲" if candle.direction == "UP" else "▼"
+        symbol = "UP" if candle.direction == "UP" else "DN"
         color  = GREEN if candle.direction == "UP" else RED
         mkt    = f" {_mkt_tag(market_key)}" if market_key else ""
         print(
@@ -78,7 +78,7 @@ class BotLogger:
     def sequence_detected(self, direction: str, candles, market_ticker: str = "", market_key: str = ""):
         from config import SEQUENCE_LENGTH
         color    = GREEN if direction == "UP" else RED
-        arrow    = ("▲" if direction == "UP" else "▼") * SEQUENCE_LENGTH
+        arrow    = (">" if direction == "UP" else "<") * SEQUENCE_LENGTH
         opposite = "DOWN" if direction == "UP" else "UP"
 
         mkt_tag     = f"  {_mkt_tag(market_key)}" if market_key else ""
@@ -98,7 +98,7 @@ class BotLogger:
         label   = "MARTINGALE" if is_martingale else "ENTRY     "
         color   = MAGENTA if is_martingale else CYAN
         ok      = price <= 0.40
-        pmark   = f"{GREEN}✔ BELOW LIMIT{RESET}" if ok else f"{YELLOW}above limit{RESET}"
+        pmark   = f"{GREEN}v BELOW LIMIT{RESET}" if ok else f"{YELLOW}above limit{RESET}"
         bar     = _progress_bar(elapsed, window)
         mkt     = f"{_mkt_tag(market_key)} " if market_key else ""
         bid_str = f" (Bid: {bid:.3f})" if bid > 0 else ""
@@ -119,7 +119,7 @@ class BotLogger:
 
         print()
         print(f"{DIM}{LINE}{RESET}")
-        print(f"{_ts()}  {color}{BOLD}▶ ORDER PLACED — {label}{mkt}{RESET}")
+        print(f"{_ts()}  {color}{BOLD}> ORDER PLACED -- {label}{mkt}{RESET}")
         print(
             f"          Side    : {BOLD}{trade.side}{RESET}\n"
             f"          Price   : {BOLD}{trade.entry_price:.3f}{RESET}\n"
@@ -140,7 +140,7 @@ class BotLogger:
         print()
         print(f"{color}{BOLD}{DLINE}{RESET}")
         print(
-            f"{_ts()}  {color}{BOLD}✔ CANDLE CLOSED IN FAVOR{mkt}  "
+            f"{_ts()}  {color}{BOLD}v CANDLE CLOSED IN FAVOR{mkt}  "
             f"({candle.direction}){RESET}"
         )
         print(f"{color}{BOLD}{DLINE}{RESET}\n")
@@ -148,15 +148,15 @@ class BotLogger:
     def loss_signal(self, msg: str, market_key: str = ""):
         mkt = f"{_mkt_tag(market_key)} " if market_key else ""
         print()
-        print(f"{RED}{BOLD}  ✖ {mkt}{msg}{RESET}\n")
+        print(f"{RED}{BOLD}  x {mkt}{msg}{RESET}\n")
 
     def timeout(self, msg: str, market_key: str = ""):
         mkt = f"{_mkt_tag(market_key)} " if market_key else ""
-        print(f"{DIM}{_ts()}{RESET} {YELLOW}⏱ {mkt}{msg}{RESET}")
+        print(f"{DIM}{_ts()}{RESET} [T] {mkt}{msg}{RESET}")
 
     def state_change(self, new_state: str, market_key: str = ""):
         mkt = f"{_mkt_tag(market_key)} " if market_key else ""
-        print(f"{DIM}{_ts()}  {mkt}State → {BOLD}{new_state}{RESET}")
+        print(f"{DIM}{_ts()}  {mkt}State -> {BOLD}{new_state}{RESET}")
 
     def startup_info(self, token_ids: dict, trade_size: float, market_slug: str = ""):
         slug = market_slug or "updown-5m"
@@ -205,6 +205,9 @@ class MarketLogger:
 
     def success(self, msg: str):
         self._log.success(f"[{self.market_key}] {msg}")
+
+    def debug(self, msg: str):
+        self._log.debug(f"[{self.market_key}] {msg}")
 
     # ------------------------------------------------------------------ #
     # Specialized formatted methods — inject market_key into BotLogger    #
@@ -258,5 +261,5 @@ class MarketLogger:
 def _progress_bar(elapsed: float, total: float, width: int = 10) -> str:
     ratio  = min(elapsed / total, 1.0)
     filled = int(ratio * width)
-    bar    = "█" * filled + "░" * (width - filled)
+    bar    = "#" * filled + "-" * (width - filled)
     return f"[{bar}]"

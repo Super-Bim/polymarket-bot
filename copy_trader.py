@@ -159,6 +159,9 @@ class CopyTrader:
 
     def _sell(self, reason: str):
         if not self.current_trade: return
+        trade = self.current_trade
+        price = self.poly.get_bid_price(trade.token_id)
+        
         if price > 0.0:
             exact_shares = self.poly.get_exact_token_balance(trade.token_id)
             if exact_shares <= 0.0:

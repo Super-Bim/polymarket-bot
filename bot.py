@@ -13,6 +13,12 @@ from dotenv import load_dotenv
 # Load .env first
 load_dotenv()
 
+# Ensure we use the local py-clob-client-v2-main if it exists
+local_sdk_path = os.path.join(os.path.dirname(__file__), "py-clob-client-v2-main")
+if os.path.exists(local_sdk_path):
+    sys.path.insert(0, local_sdk_path)
+    print(f"INFO: Using local SDK from: {local_sdk_path}")
+
 from config import (
     BASE_TRADE_SIZE_USDC, SEQUENCE_LENGTH,
     MARKETS, get_active_markets,

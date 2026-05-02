@@ -3,17 +3,18 @@
 # =============================================================
 
 import os
+import sys
 import time
 import socket
 import requests
 from typing import Optional, Dict
 
-# ------------------------------------------------------------------
-# DNS Resilience — Cached Cloudflare IPs for Polymarket endpoints.
-# Acts as a fallback when system DNS fails to resolve Polymarket
-# domains (e.g. restrictive ISPs, corporate firewalls, VPN configs).
-# These are Polymarket's own public Cloudflare CDN addresses.
-# ------------------------------------------------------------------
+# Ensure we use the local py-clob-client-v2-main if it exists
+_local_sdk_path = os.path.join(os.path.dirname(__file__), "py-clob-client-v2-main")
+if os.path.exists(_local_sdk_path) and _local_sdk_path not in sys.path:
+    sys.path.insert(0, _local_sdk_path)
+
+
 _POLYMARKET_IPS = {
     "gamma-api.polymarket.com": "172.64.153.51",
     "clob.polymarket.com":      "172.64.153.51",
@@ -52,7 +53,15 @@ class PolymarketClient:
         self.log        = logger
         self.host       = CLOB_HOST
         self.gamma_api  = GAMMA_API
-        self._session   = requests.Session()
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://polymarket.com",
+            "Referer": "https://polymarket.com/",
+            "Content-Type": "application/json"
+        })
         self._price_cache = {} # Cache for Gamma prices
         self._session.headers.update({
             "Accept":          "application/json, text/plain, */*",
@@ -70,9 +79,9 @@ class PolymarketClient:
         self.pk         = os.getenv("PRIVATE_KEY")
         self.sig_type   = int(os.getenv("SIGNATURE_TYPE", "2"))
         self.funder     = os.getenv("FUNDER_ADDRESS")
-        api_key         = os.getenv("POLY_API_KEY", "")
-        api_secret      = os.getenv("POLY_API_SECRET", "")
-        api_passphrase  = os.getenv("POLY_API_PASSPHRASE", "")
+        api_key         = os.getenv("CLOB_API_KEY", os.getenv("POLY_API_KEY", "")).strip("'\"")
+        api_secret      = os.getenv("CLOB_SECRET", os.getenv("POLY_API_SECRET", "")).strip("'\"")
+        api_passphrase  = os.getenv("CLOB_PASS_PHRASE", os.getenv("POLY_API_PASSPHRASE", "")).strip("'\"")
         self.creds      = None
 
         # Validate essential credentials
@@ -100,8 +109,13 @@ class PolymarketClient:
             funder          = self.funder,
             retry_on_error  = True
         )
+        if hasattr(self._l1_client, "client"):
+            self._l1_client.client.headers.update(self._session.headers)
 
-        # Derive or use L2 credentials
+        # 1. Patch the SDK globally to bypass Cloudflare
+        self._patch_clob_sdk()
+
+        # 2. Derive or use L2 credentials
         new_creds_generated = False
         if api_key and api_secret and api_passphrase:
             self.creds = ApiCreds(
@@ -109,17 +123,38 @@ class PolymarketClient:
                 api_secret     = api_secret,
                 api_passphrase = api_passphrase,
             )
+            
+            # Validation Step: Test if these keys actually work
+            if self.log: self.log.info("INFO: Verifying existing API keys...")
+            try:
+                test_client = ClobClient(
+                    host            = self.host,
+                    key             = self.pk,
+                    chain_id        = CHAIN_ID,
+                    creds           = self.creds,
+                    signature_type  = self.sig_type,
+                    funder          = self.funder
+                )
+                # Try an authenticated call
+                test_client.get_open_orders(only_first_page=True)
+                if self.log: self.log.success("SUCCESS: API keys verified successfully.")
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    if self.log: self.log.warn("WARNING: Existing API keys are invalid (401). Regenerating...")
+                    self.creds = self._get_creds(force_derive=True)
+                    new_creds_generated = True
+                else:
+                    # Likely a network/Cloudflare issue, keep them for now
+                    if self.log: self.log.warn(f"WARNING: API key verification skipped (Network issue): {e}")
         else:
-            if self.log:
-                self.log.info("Generating Polymarket API credentials (first run)...")
-            self.creds = self._l1_client.create_or_derive_api_key()
+            self.creds = self._get_creds()
             new_creds_generated = True
 
         # Persistence: Update .env if something was derived or generated
         if derived_funder or new_creds_generated:
             self._update_env_file(self.funder, self.creds)
 
-        # Recreate client with L2 creds
+        # Recreate final client with L2 creds
         self._client = ClobClient(
             host            = self.host,
             key             = self.pk,
@@ -129,6 +164,8 @@ class PolymarketClient:
             funder          = self.funder,
             retry_on_error  = True
         )
+        if hasattr(self._client, "client"):
+            self._client.client.headers.update(self._session.headers)
 
         # Session Stats for Real Mode Dashboard
         self.stats = None
@@ -138,6 +175,108 @@ class PolymarketClient:
     # ------------------------------------------------------------------ #
     # Web3 & RPC Helpers                                                   #
     # ------------------------------------------------------------------ #
+
+    def _patch_clob_sdk(self):
+        """
+        Applies a more robust patch to the CLOB SDK to bypass Cloudflare
+        while maintaining compatibility with the local SDK.
+        """
+        import py_clob_client_v2.http_helpers.helpers as sdk_helpers
+        import cloudscraper
+        from py_clob_client_v2.exceptions import PolyApiException
+        
+        # Use a single scraper instance
+        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+        
+        def patched_overload(method: str, headers: dict) -> dict:
+            if headers is None: headers = {}
+            new_headers = headers.copy()
+            new_headers["Accept"] = "application/json"
+            new_headers["Connection"] = "keep-alive"
+            if "Content-Type" not in new_headers:
+                new_headers["Content-Type"] = "application/json"
+            
+            # Use a realistic User-Agent to bypass Cloudflare
+            new_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            return new_headers
+
+        def patched_request(endpoint: str, method: str, headers=None, data=None, params=None):
+            headers = patched_overload(method, headers)
+            
+            # Avoid adding cache-buster to authenticated requests (breaks HMAC)
+            if method == "GET" and "POLY-SIGNATURE" not in headers:
+                if params is None: params = {}
+                import time
+                params["_t"] = int(time.time() * 1000)
+            
+            try:
+                # Use generic request to ensure all args are passed correctly
+                # POST and DELETE might carry a body (data)
+                curr_data = data
+                if isinstance(curr_data, str):
+                    curr_data = curr_data.encode("utf-8")
+
+                resp = scraper.request(
+                    method  = method,
+                    url     = endpoint,
+                    headers = headers,
+                    data    = curr_data if method != "GET" else None,
+                    params  = params,
+                    timeout = 30
+                )
+                
+                if resp.status_code != 200:
+                    if self.log:
+                        self.log.info(f"DEBUG: SDK Request failed: {resp.status_code} {method} {endpoint}")
+                        self.log.info(f"DEBUG: Response: {resp.text[:200]}")
+                    raise PolyApiException(resp)
+                
+                try:
+                    return resp.json()
+                except:
+                    return resp.text
+            except PolyApiException:
+                raise
+            except Exception as e:
+                if self.log: self.log.error(f"Network error in SDK patch: {e}")
+                raise
+
+        # Apply patches to the module
+        sdk_helpers._overload_headers = patched_overload
+        sdk_helpers.request = patched_request
+        
+        # --- Rounding Monkey Patches (Fixes Tick Size and Internal SDK Slippage) ---
+        from py_clob_client_v2.order_builder.builder import OrderBuilder
+        
+        _orig_build_order = OrderBuilder.build_order
+        def patched_build_order(self, order_args, options, version=1, fee_rate_bps=None):
+            # CRITICAL FIX: The SDK applies internal slippage (e.g. * 1.000015) 
+            # We must round the price to 0.01 at the very last moment here.
+            if hasattr(order_args, 'price') and order_args.price is not None:
+                order_args.price = round(float(order_args.price), 2)
+            return _orig_build_order(self, order_args, options, version, fee_rate_bps)
+        OrderBuilder.build_order = patched_build_order
+        # --------------------------------------------------------------------------
+
+        if self.log: self.log.info("INFO: Cloudflare bypass and Final Rounding patches applied to CLOB SDK.")
+
+    def _get_creds(self, force_derive: bool = False) -> ApiCreds:
+        """Loads credentials from ENV or derives them using the patched SDK."""
+        if not force_derive:
+            key = os.getenv("CLOB_API_KEY")
+            secret = os.getenv("CLOB_SECRET")
+            passphrase = os.getenv("CLOB_PASS_PHRASE")
+            
+            if key and secret and passphrase:
+                return ApiCreds(api_key=key, api_secret=secret, api_passphrase=passphrase)
+        
+        print("INFO: Generating Polymarket API credentials via patched SDK...")
+        try:
+            # Use the L1 client which was already initialized in __init__
+            return self._l1_client.create_or_derive_api_key()
+        except Exception as e:
+            print(f"✖  Key derivation failed: {str(e)}")
+            raise
 
     def _get_w3(self):
         """Returns a connected Web3 instance using a fallback RPC list."""
@@ -196,7 +335,7 @@ class PolymarketClient:
             usdc_balance = usdc_balance_wei / 1_000_000
             
             if self.log:
-                self.log.info(f"💰 [Polymarket] Balances: {pusd_balance:.2f} pUSD | {usdc_balance:.2f} USDC.e")
+                self.log.info(f"BALANCES: [Polymarket] {pusd_balance:.2f} pUSD | {usdc_balance:.2f} USDC.e")
 
             # --- 3. Automatic Wrapping (USDC.e -> pUSD) ---
             if usdc_balance >= 1.0:
@@ -208,7 +347,7 @@ class PolymarketClient:
             
             # --- 4. Diagnostics ---
             if pusd_balance < 1.0 and usdc_balance < 1.0:
-                if self.log: self.log.error(f"❌ [Polymarket] Low collateral balance. Add USDC to your wallet.")
+                if self.log: self.log.error(f"ERROR: [Polymarket] Low collateral balance. Add USDC to your wallet.")
 
             # Initialize stats with pUSD balance
             if not self._initial_balance_set:
@@ -227,7 +366,7 @@ class PolymarketClient:
             
             if current_allowance < required_wei:
                 if self.log:
-                    self.log.warn(f"⚠ [Polymarket] Authorizing V2 Exchange {v2_exchange[:10]}...")
+                    self.log.warn(f"WARNING: [Polymarket] Authorizing V2 Exchange {v2_exchange[:10]}...")
                 
                 tx_func = pusd_contract.functions.approve(
                     w3.to_checksum_address(v2_exchange), 
@@ -235,19 +374,19 @@ class PolymarketClient:
                 )
                 tx_params = self._build_tx_params(w3, account.address, tx_func)
                 
-                signed_tx = w3.eth.account.sign_transaction(tx, private_key=self.pk)
+                signed_tx = w3.eth.account.sign_transaction(tx_params, private_key=self.pk)
                 tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 
                 if self.log:
-                    self.log.info(f"✅ [Polymarket] Approval transaction sent! TX: {w3.to_hex(tx_hash)}")
+                    self.log.info(f"SUCCESS: [Polymarket] Approval transaction sent! TX: {w3.to_hex(tx_hash)}")
                     self.log.info("Waiting for confirmation (usually 10-20s)...")
                 
                 # Wait for confirmation
                 w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                if self.log: self.log.info("✅ [Polymarket] Spender authorized successfully.")
+                if self.log: self.log.info("SUCCESS: [Polymarket] Spender authorized successfully.")
             else:
                 if self.log:
-                    self.log.info(f"✅ [Polymarket] Spender authorized (Allowance: {current_allowance/1e6:,.0f} USDC).")
+                    self.log.info(f"SUCCESS: [Polymarket] Spender authorized (Allowance: {current_allowance/1e6:,.0f} USDC).")
             
             # --- Check CTF ERC1155 Allowance (for Selling) ---
             ctf_addr = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -262,7 +401,7 @@ class PolymarketClient:
             ).call()
 
             if not is_approved:
-                if self.log: self.log.warn(f"⚠ [Polymarket] CTF V2 Exchange Not Approved. Authorizing for Sells...")
+                if self.log: self.log.warn(f"WARNING: [Polymarket] CTF V2 Exchange Not Approved. Authorizing for Sells...")
                 matic_balance = w3.eth.get_balance(account.address)
                 if matic_balance < w3.to_wei(0.01, 'ether'):
                     if self.log: self.log.error("[Polymarket] Insufficient MATIC for CTF approval!")
@@ -274,11 +413,11 @@ class PolymarketClient:
                 tx_params = self._build_tx_params(w3, account.address, tx_func)
                 signed_tx2 = w3.eth.account.sign_transaction(tx_params, self.pk)
                 tx_hash2 = w3.eth.send_raw_transaction(signed_tx2.raw_transaction)
-                if self.log: self.log.info(f"✅ [Polymarket] CTF Approval sent! TX: {w3.to_hex(tx_hash2)}")
+                if self.log: self.log.info(f"SUCCESS: [Polymarket] CTF Approval sent! TX: {w3.to_hex(tx_hash2)}")
                 w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=120)
-                if self.log: self.log.info("✅ [Polymarket] CTF shares authorized for exchange successfully.")
+                if self.log: self.log.info("SUCCESS: [Polymarket] CTF shares authorized for exchange successfully.")
             else:
-                if self.log: self.log.info(f"✅ [Polymarket] CTF shares authorized for exchange.")
+                if self.log: self.log.info(f"SUCCESS: [Polymarket] CTF shares authorized for exchange.")
 
         except Exception as e:
             if self.log:
@@ -348,10 +487,14 @@ class PolymarketClient:
         t.start()
 
     def _cleanup_worker(self):
-        """Continuously checks for redeemable positions every 5 minutes and executes on-chain claims."""
+        """Continuously checks for redeemable positions and USDC.e balance every 5 minutes."""
         funder = self.funder
         while True:
             try:
+                # 1. Check for USDC.e balance and wrap to pUSD
+                self.auto_wrap_usdc_to_pusd()
+                
+                # 2. Check and redeem positions
                 resp = self._session.get(
                     f"https://data-api.polymarket.com/positions",
                     params={"user": funder},
@@ -371,75 +514,38 @@ class PolymarketClient:
                 pass
             time.sleep(300) # Loop every 5 min
 
-    def _update_env_file(self, funder: str, creds: ApiCreds):
-        """Persists derived/generated credentials to the .env file."""
+    def _update_env_file(self, funder_address: str, creds: ApiCreds):
+        """Updates the .env file with derived funder and credentials."""
         try:
+            import os
             env_path = ".env"
-            if not os.path.exists(env_path):
-                # If .env doesn't exist (though it should), try creating it from example or just raw
-                if os.path.exists(".env.example"):
-                    import shutil
-                    shutil.copy(".env.example", ".env")
-                else:
-                    with open(env_path, "w") as f: f.write("")
+            env_data = {}
+            if os.path.exists(env_path):
+                with open(env_path, "r") as f:
+                    for line in f:
+                        if "=" in line:
+                            parts = line.strip().split("=", 1)
+                            if len(parts) == 2:
+                                k, v = parts
+                                env_data[k.strip()] = v.strip()
 
-            set_key(env_path, "FUNDER_ADDRESS", funder)
-            set_key(env_path, "POLY_API_KEY", creds.api_key)
-            set_key(env_path, "POLY_API_SECRET", creds.api_secret)
-            set_key(env_path, "POLY_API_PASSPHRASE", creds.api_passphrase)
-
-            # Update current process environment to avoid stale data in os.getenv calls
-            os.environ["FUNDER_ADDRESS"]     = funder
-            os.environ["POLY_API_KEY"]        = creds.api_key
-            os.environ["POLY_API_SECRET"]     = creds.api_secret
-            os.environ["POLY_API_PASSPHRASE"] = creds.api_passphrase
-
-            if self.log:
-                self.log.info("✅ Credentials saved to .env automatically.")
-        except Exception as e:
-            if self.log:
-                self.log.error(f"Failed to auto-update .env file: {e}")
-
-    def _add_to_redeem_queue(self, condition_id: str):
-        if not condition_id: return
-        self._redeem_queue[condition_id] = True
-
-    def reconstruct_queue_from_history(self):
-        """Scans Data API for positions with balance and populates the redemption queue."""
-        if self.log: self.log.info("🔍 Scanning for positions with balance via Data API...")
-        try:
-            resp = self._session.get(f"https://data-api.polymarket.com/positions", params={"user": self.funder}, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                found_any = False
-                for pos in data:
-                    size   = float(pos.get("size", 0))
-                    cid    = pos.get("conditionId")
-                    if size > 0.001 and cid:
-                        found_any = True
-                        if self.log: self.log.info(f"💎 [DATA_HIT] Found {size:.2f} shares in {cid[:10]}...")
-                        self._add_to_redeem_queue(cid)
-                
-                if not found_any and self.log:
-                    self.log.info("ℹ No positions with balance found in history.")
-        except Exception as e:
-            if self.log: self.log.error(f"❌ Failed to scan history: {e}")
-
-    def rescue_open_orders(self):
-        """Cancels all open and conditional orders."""
-        if self.log: self.log.warn("🧹 Rescuing all open and conditional orders...")
-        try:
-            self._client.cancel_all()
-            if self.log: self.log.info(f"✅ Limit orders cancelled.")
+            # Update critical keys with standard names (no quotes)
+            env_data["FUNDER_ADDRESS"] = funder_address
+            env_data["CLOB_API_KEY"] = creds.api_key
+            env_data["CLOB_SECRET"] = creds.api_secret
+            env_data["CLOB_PASS_PHRASE"] = creds.api_passphrase
             
-            try:
-                self._client.cancel_all_conditional_orders()
-                if self.log: self.log.success("✅ All conditional orders cleared.")
-            except: pass
+            # Clean up old keys if they exist
+            for old_key in ["POLY_API_KEY", "POLY_API_SECRET", "POLY_API_PASSPHRASE"]:
+                env_data.pop(old_key, None)
+
+            with open(env_path, "w") as f:
+                for k, v in env_data.items():
+                    f.write(f"{k}={v}\n")
             
-            if self.log: self.log.success("✔ Order rescue completed.")
+            print("INFO: Credentials saved to .env automatically.")
         except Exception as e:
-            if self.log: self.log.error(f"❌ Failed to rescue orders: {e}")
+            print(f"ERROR: Failed to update .env: {e}")
 
     # ------------------------------------------------------------------ #
     # Active Market Discovery                                              #
@@ -576,50 +682,6 @@ class PolymarketClient:
         token_ids["market_ticker"] = event.get("ticker", "Unknown")
         return token_ids
 
-
-    def check_is_winner(self, token_id: str, timeout_seconds: int = 15) -> Optional[bool]:
-        """
-        Polls the Gamma API to verify if the token_id settled as winner.
-        """
-        start = time.time()
-        import json as _json
-        while time.time() - start < timeout_seconds:
-            try:
-                resp = self._session.get(
-                    f"{self.gamma_api}/markets",
-                    params={"clob_token_ids": token_id, "ts": int(time.time() * 1000)},
-                    timeout=5,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        market = data[0]
-                        if market.get("closed") or not market.get("active"):
-                            clob_ids = market.get("clobTokenIds", "[]")
-                            if isinstance(clob_ids, str):
-                                try: clob_ids = _json.loads(clob_ids)
-                                except: clob_ids = []
-                            
-                            prices = market.get("outcomePrices", "[]")
-                            if isinstance(prices, str):
-                                try: prices = _json.loads(prices)
-                                except: prices = []
-                                
-                            if isinstance(clob_ids, list) and isinstance(prices, list):
-                                try:
-                                    idx = clob_ids.index(token_id)
-                                    p = float(prices[idx])
-                                    if p == 1.0: return True
-                                    elif p == 0.0: return False
-                                except ValueError: pass
-            except Exception: pass
-            time.sleep(2.0)
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Prices                                                               #
-    # ------------------------------------------------------------------ #
-
     def get_ask_price(self, token_id: str) -> float:
         if not token_id: return 0.0
         return self._get_price(token_id, "sell")
@@ -682,10 +744,6 @@ class PolymarketClient:
             return self._price_cache.get(token_id, 0.0)
         except:
             return self._price_cache.get(token_id, 0.0)
-
-    # ------------------------------------------------------------------ #
-    # Settlement & Background Tasks                                        #
-    # ------------------------------------------------------------------ #
 
     def register_win_for_settlement(self, trade_record, total_spent: float = 0, early_exit_price: float = 0, market: str = ""):
         import threading
@@ -788,7 +846,7 @@ class PolymarketClient:
             if not w3: return
             account = w3.eth.account.from_key(self.pk)
             
-            abi_token = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},{"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]
+            abi_token = [{"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]
             usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi_token)
             bal_wei = usdc_contract.functions.balanceOf(w3.to_checksum_address(self.funder)).call()
             if bal_wei < 1_000_000: return
@@ -887,18 +945,6 @@ class PolymarketClient:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ #
-    # Helper Methods                                                       #
-    # ------------------------------------------------------------------ #
-
-    def cancel_all_orders(self) -> dict:
-        try:
-            resp = self._client.cancel_all()
-            if self.log: self.log.info(f"🧹 [Polymarket] Orders sweep sent.")
-            return {"success": True, "data": resp}
-        except Exception as e:
-            return {"success": False, "errorMsg": str(e)}
-
     def buy(self, token_id: str, price: float, size_usdc: float, is_martingale: bool = False, market: str = "") -> dict:
         """
         Executes a MARKET BUY order with a $0.05 slippage buffer.
@@ -917,8 +963,6 @@ class PolymarketClient:
             signed_order = self._client.create_market_order(order_args)
             resp = self._client.post_order(signed_order, OrderType.FOK)
             
-            # Response handling for FOK (Immediate or Cancel)
-                
             if self.stats and (resp.get("success") or resp.get("status") in ("live", "matched")):
                 # Refresh balance and record
                 bals = self.get_balances()
@@ -1027,3 +1071,44 @@ class PolymarketClient:
             return resp.get("id", heartbeat_id)
         except Exception:
             return ""
+
+    def rescue_open_orders(self):
+        """Cancels all open and conditional orders."""
+        if self.log: self.log.warn("🧹 Rescuing all open and conditional orders...")
+        try:
+            self._client.cancel_all()
+            if self.log: self.log.info(f"✅ Limit orders cancelled.")
+            
+            try:
+                self._client.cancel_all_conditional_orders()
+                if self.log: self.log.success("✅ All conditional orders cleared.")
+            except: pass
+            
+            if self.log: self.log.success("✔ Order rescue completed.")
+        except Exception as e:
+            if self.log: self.log.error(f"❌ Failed to rescue orders: {e}")
+
+    def reconstruct_queue_from_history(self):
+        """Scans Data API for positions with balance and populates the redemption queue."""
+        if self.log: self.log.info("🔍 Scanning for positions with balance via Data API...")
+        try:
+            resp = self._session.get(f"https://data-api.polymarket.com/positions", params={"user": self.funder}, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                found_any = False
+                for pos in data:
+                    size   = float(pos.get("size", 0))
+                    cid    = pos.get("conditionId")
+                    if size > 0.001 and cid:
+                        found_any = True
+                        if self.log: self.log.info(f"💎 [DATA_HIT] Found {size:.2f} shares in {cid[:10]}...")
+                        self._add_to_redeem_queue(cid)
+                
+                if not found_any and self.log:
+                    self.log.info("ℹ No positions with balance found in history.")
+        except Exception as e:
+            if self.log: self.log.error(f"❌ Failed to scan history: {e}")
+
+    def _add_to_redeem_queue(self, condition_id: str):
+        if not condition_id: return
+        self._redeem_queue[condition_id] = True
