@@ -838,7 +838,7 @@ class PolymarketClient:
         except: pass
 
     def auto_wrap_usdc_to_pusd(self):
-        """Automatically converts USDC.e balance to pUSD with optimized gas."""
+        """Automatically converts USDC.e balance to pUSD with optimized gas and confirmation waits."""
         onramp = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
         usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         try:
@@ -846,28 +846,49 @@ class PolymarketClient:
             if not w3: return
             account = w3.eth.account.from_key(self.pk)
             
-            abi_token = [{"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]
+            # 1. Check MATIC balance first
+            matic_bal = w3.eth.get_balance(account.address)
+            if matic_bal < w3.to_wei(0.005, 'ether'):
+                if self.log: self.log.warn("⚠ [WRAPP] Low MATIC balance. Cannot wrap USDC.e.")
+                return
+
+            abi_token = [
+                {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+                {"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+                {"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}
+            ]
             usdc_contract = w3.eth.contract(address=w3.to_checksum_address(usdc_e), abi=abi_token)
             bal_wei = usdc_contract.functions.balanceOf(w3.to_checksum_address(self.funder)).call()
-            if bal_wei < 1_000_000: return
             
-            # Allowance
+            if bal_wei < 1_000_000: # Less than $1
+                return
+            
+            if self.log: self.log.info(f"🔄 [WRAPP] Detected ${bal_wei/1e6:.2f} USDC.e. Starting conversion to pUSD...")
+            
+            # 2. Allowance
             allowance = usdc_contract.functions.allowance(w3.to_checksum_address(self.funder), w3.to_checksum_address(onramp)).call()
             if allowance < bal_wei:
+                if self.log: self.log.info("🔓 [WRAPP] Authorizing Onramp contract...")
                 tx_f = usdc_contract.functions.approve(w3.to_checksum_address(onramp), 2**256-1)
                 tx_p = self._build_tx_params(w3, account.address, tx_f)
                 signed = w3.eth.account.sign_transaction(tx_p, self.pk)
-                w3.eth.send_raw_transaction(signed.raw_transaction)
-                time.sleep(3)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
                 
+            # 3. Wrap
             onramp_abi = [{"constant":False,"inputs":[{"name":"_asset","type":"address"},{"name":"_to","type":"address"},{"name":"_amount","type":"uint256"}],"name":"wrap","outputs":[],"type":"function"}]
             onramp_contract = w3.eth.contract(address=w3.to_checksum_address(onramp), abi=onramp_abi)
             tx_f = onramp_contract.functions.wrap(w3.to_checksum_address(usdc_e), w3.to_checksum_address(self.funder), bal_wei)
             tx_p = self._build_tx_params(w3, account.address, tx_f)
             signed = w3.eth.account.sign_transaction(tx_p, self.pk)
-            w3.eth.send_raw_transaction(signed.raw_transaction)
-            if self.log: self.log.success("✨ USDC.e converted to pUSD successfully.")
-        except: pass
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            
+            if self.log: self.log.info(f"⏳ [WRAPP] Wrap transaction sent. Waiting for confirmation...")
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            
+            if self.log: self.log.success(f"✨ [WRAPP] SUCCESS! ${bal_wei/1e6:.2f} USDC.e converted to pUSD.")
+        except Exception as e:
+            if self.log: self.log.error(f"❌ [WRAPP] Failed to wrap USDC.e: {e}")
 
     def _build_tx_params(self, w3, from_addr: str, tx_func) -> dict:
         """Dynamically calculates gas limit and EIP-1559 fees to minimize costs."""
@@ -1009,7 +1030,7 @@ class PolymarketClient:
                 price=limit_price,
             )
             signed_order = self._client.create_market_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.FOK)
+            resp = self._client.post_order(signed_order, OrderType.IOC)
 
             if self.stats and (resp.get("success") or resp.get("status") in ("live", "matched")):
                 # Refresh balance and record
@@ -1036,7 +1057,7 @@ class PolymarketClient:
                 price=price,
             )
             signed_order = self._client.create_market_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.FOK)
+            resp = self._client.post_order(signed_order, OrderType.IOC)
             if not resp or not resp.get("success", True):
                 return {"success": False, "errorMsg": "Rejected/No liquidity"}
             return resp or {}
