@@ -7,7 +7,7 @@ import time
 import threading
 import websocket
 from typing import Callable, List, Optional
-from config import SEQUENCE_LENGTH
+from config import SEQUENCE_LENGTH, any_filters_active
 
 
 class Candle:
@@ -88,8 +88,10 @@ class BinanceStream:
 
             if candle.closed:
                 self._closed_candles.append(candle)
-                # Keep only the last SEQUENCE_LENGTH + 2 candles
-                if len(self._closed_candles) > SEQUENCE_LENGTH + 2:
+                
+                # Dynamic Retention Limit: 100 for indicators, or only SEQUENCE+2 for standard strategy
+                retention_limit = 100 if any_filters_active() else (SEQUENCE_LENGTH + 2)
+                if len(self._closed_candles) > retention_limit:
                     self._closed_candles.pop(0)
 
                 self.on_candle_close(candle)
@@ -131,7 +133,8 @@ class BinanceStream:
         directions = [c.direction for c in last_n]
 
         if len(set(directions)) == 1:
-            self.on_sequence(directions[0], last_n)
+            # Pass total history of closed candles to strategy
+            self.on_sequence(directions[0], list(self._closed_candles))
 
     # ------------------------------------------------------------------ #
     # Stream control                                                       #
@@ -155,11 +158,17 @@ class BinanceStream:
         """Fetches the latest closed candles via REST API to avoid starting 'blind'."""
         try:
             import requests
-            if self.log:
-                self.log.info(f"[Binance:{self._symbol}] Downloading recent history to speed up entries...")
             
-            # Get the previous 4 candles (limit=5, ignores the last one which is open)
-            url = f"https://api.binance.com/api/v3/klines?symbol={self._symbol}&interval=5m&limit=5"
+            # Pre-calculate how many candles we actually NEED based on active configuration
+            has_filters = any_filters_active()
+            req_limit = 101 if has_filters else (SEQUENCE_LENGTH + 3)
+            
+            if self.log:
+                label = "for indicator calculation" if has_filters else "for standard operation"
+                self.log.info(f"[Binance:{self._symbol}] Preloading {req_limit - 1} candles {label}...")
+            
+            # Fetch precisely the count we actually require
+            url = f"https://api.binance.com/api/v3/klines?symbol={self._symbol}&interval=5m&limit={req_limit}"
             res = requests.get(url, timeout=10)
             klines = res.json()
             
@@ -178,9 +187,9 @@ class BinanceStream:
                 }
                 c = Candle(simulated_k)
                 self._closed_candles.append(c)
-                if self.log:
-                    # Logging to give visual feedback of the preloading
-                    self.log.candle_close(c)
+            
+            if self.log:
+                 self.log.info(f"[Binance:{self._symbol}] Successfully preloaded {len(klines[:-1])} history candles.")
             
             # Check if sequence is already hit on boot
             self._check_sequence()

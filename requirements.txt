@@ -3,3 +3,6 @@ python-dotenv>=1.0.0
 websocket-client>=1.7.0
 requests>=2.31.0
 web3
+cloudscraper>=1.2.71
+pandas>=2.0.0
+numpy>=1.20.0

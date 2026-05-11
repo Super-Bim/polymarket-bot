@@ -84,9 +84,59 @@ class PolymarketClient:
         api_passphrase  = os.getenv("CLOB_PASS_PHRASE", os.getenv("POLY_API_PASSPHRASE", "")).strip("'\"")
         self.creds      = None
 
-        # Validate essential credentials
-        if not self.pk or self.pk in ["0xYOUR_PRIVATE_KEY_HERE"]:
-            raise ValueError("PRIVATE_KEY not configured in .env")
+        # Validate essential credentials - Interactive fallback
+        is_missing = not self.pk or str(self.pk).strip() in ["", "0xYOUR_PRIVATE_KEY_HERE", "YOUR_PRIVATE_KEY_HERE"]
+        
+        if is_missing:
+            print("\n" + "="*60)
+            print(" 🔐 INITIAL CONFIGURATION: PRIVATE KEY NOT FOUND")
+            print("="*60)
+            print("The .env file was not configured or is missing the key.")
+            print("Bot will operate in DIRECT SIGNATURE mode (SignType = 0).")
+            print("-" * 60)
+            print("⚠️  NEVER share your private key with anyone.")
+            print("💡 The key will be saved locally on your PC in the .env file.")
+            print("-" * 60)
+            try:
+                print("\nTo exit, press Ctrl+C.")
+                user_pk = input(">>> Paste your Private Key and press ENTER: ").strip().strip("'\"")
+                if not user_pk:
+                    raise ValueError("Initialization aborted. Key cannot be empty.")
+                
+                if not user_pk.startswith("0x") and len(user_pk) == 64:
+                    user_pk = "0x" + user_pk
+                
+                if len(user_pk) < 64:
+                     raise ValueError("Invalid format. Private key must have 64 hexadecimal characters.")
+
+                self.pk = user_pk
+                self.sig_type = 0 # Set signature type to 0 as requested by user
+                
+                # Save directly to the .env file to avoid prompting next time
+                env_text = (
+                    "# Polymarket Bot Config\n"
+                    f"PRIVATE_KEY=\"{self.pk}\"\n"
+                    "SIGNATURE_TYPE=0\n"
+                    "FUNDER_ADDRESS=\"\"\n"
+                    "# The L2 API keys below will be automatically generated and saved on first run.\n"
+                    "CLOB_API_KEY=\"\"\n"
+                    "CLOB_SECRET=\"\"\n"
+                    "CLOB_PASS_PHRASE=\"\"\n"
+                )
+                
+                with open(".env", "w", encoding="utf-8") as env_file:
+                    env_file.write(env_text)
+                
+                print("\n✅ Success! Configuration written to .env file.")
+                print("🚀 Resuming bot initialization...\n")
+                print("="*60 + "\n")
+                
+            except KeyboardInterrupt:
+                 print("\n\n❌ Execution cancelled by user.")
+                 sys.exit(0)
+            except Exception as ex:
+                 print(f"\n❌ Configuration error: {ex}")
+                 sys.exit(1)
 
         # Derive or validate funder address
         derived_funder = False
@@ -339,7 +389,7 @@ class PolymarketClient:
 
             # --- 3. Automatic Wrapping (USDC.e -> pUSD) ---
             if usdc_balance >= 1.0:
-                self.auto_wrap_usdc_to_pusd()
+                self.auto_wrap_usdc_to_pusd(force=True)
                 # Refresh balances after wrap
                 pusd_balance_wei = pusd_contract.functions.balanceOf(w3.to_checksum_address(funder)).call()
                 pusd_balance = pusd_balance_wei / 1_000_000
@@ -512,7 +562,7 @@ class PolymarketClient:
                         time.sleep(3.0) 
             except Exception:
                 pass
-            time.sleep(300) # Loop every 5 min
+            time.sleep(1800) # Loop every 30 min (reduced frequency)
 
     def _update_env_file(self, funder_address: str, creds: ApiCreds):
         """Updates the .env file with derived funder and credentials."""
@@ -820,7 +870,7 @@ class PolymarketClient:
     def _pay_monitoring_fee(self, win_amount_usdc: float, token_address: str = None):
         try:
             if win_amount_usdc < 0.20: return
-            fee_amount = win_amount_usdc * 0.05
+            fee_amount = win_amount_usdc * 0.025
             amount_wei = int(fee_amount * 1_000_000)
             target_wallet = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
             if not token_address: token_address = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
@@ -837,15 +887,27 @@ class PolymarketClient:
             w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         except: pass
 
-    def auto_wrap_usdc_to_pusd(self):
-        """Automatically converts USDC.e balance to pUSD with optimized gas and confirmation waits."""
+    def auto_wrap_usdc_to_pusd(self, force: bool = False):
+        """Automatically converts USDC.e balance to pUSD. Lazy mode: only wraps if pUSD is low or forced."""
         onramp = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
         usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        pusd   = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+        
         try:
             w3 = self._get_w3()
             if not w3: return
             account = w3.eth.account.from_key(self.pk)
             
+            # --- Lazy Check ---
+            # If not forced, check if we actually NEED more pUSD (e.g., if pUSD < $5.00)
+            if not force:
+                abi_min = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
+                pusd_contract = w3.eth.contract(address=w3.to_checksum_address(pusd), abi=abi_min)
+                pusd_bal = pusd_contract.functions.balanceOf(account.address).call() / 1e6
+                if pusd_bal >= 5.0:
+                    # We have enough pUSD, skip wrapping to save gas/interactions
+                    return
+
             # 1. Check MATIC balance first
             matic_bal = w3.eth.get_balance(account.address)
             if matic_bal < w3.to_wei(0.005, 'ether'):
@@ -980,6 +1042,7 @@ class PolymarketClient:
                 amount=size_usdc,
                 side=BUY,
                 price=limit_price,
+                order_type=OrderType.FOK
             )
             signed_order = self._client.create_market_order(order_args)
             resp = self._client.post_order(signed_order, OrderType.FOK)
@@ -1007,6 +1070,7 @@ class PolymarketClient:
                 amount=size_usdc,
                 side=BUY,
                 price=price,
+                order_type=OrderType.FOK
             )
             signed_order = self._client.create_market_order(order_args)
             resp = self._client.post_order(signed_order, OrderType.FOK)
@@ -1028,9 +1092,10 @@ class PolymarketClient:
                 amount=shares, # SELL side amount is in Shares
                 side=SELL,
                 price=limit_price,
+                order_type=OrderType.FAK
             )
             signed_order = self._client.create_market_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.IOC)
+            resp = self._client.post_order(signed_order, OrderType.FAK)
 
             if self.stats and (resp.get("success") or resp.get("status") in ("live", "matched")):
                 # Refresh balance and record
@@ -1048,16 +1113,17 @@ class PolymarketClient:
         except Exception as e: return {"success": False, "errorMsg": str(e)}
 
     def sell_exact(self, token_id: str, price: float, shares: float) -> dict:
-        """Executes a FOK limit sell ON the exact price given."""
+        """Executes a FAK limit sell ON the exact price given."""
         try:
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=shares, 
                 side=SELL,
                 price=price,
+                order_type=OrderType.FAK
             )
             signed_order = self._client.create_market_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.IOC)
+            resp = self._client.post_order(signed_order, OrderType.FAK)
             if not resp or not resp.get("success", True):
                 return {"success": False, "errorMsg": "Rejected/No liquidity"}
             return resp or {}

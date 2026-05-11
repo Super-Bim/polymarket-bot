@@ -26,6 +26,7 @@ from config import (
     INDECISION_PRICE_RANGE,
     IDLE_AFTER_GALE_LIMIT,
 )
+from indicators import evaluate_filters
 
 
 # ------------------------------------------------------------------ #
@@ -159,6 +160,14 @@ class Strategy:
                 self.log.warn(f"Token ID for {opposite} not found. Ignoring.")
                 return
 
+            # --- Technical Filters Gate ---
+            passed, msg = evaluate_filters(candles, opposite, logger=self.log)
+            if not passed:
+                 self.log.info(f"SEQUENCE IGNORED: {msg}")
+                 return
+            else:
+                 self.log.success(f"FILTERS CONFIRMED: {msg}")
+
             self.sequence_direction = direction
             self.sequence_time      = synced_time()
             self.target_side        = opposite
@@ -168,9 +177,21 @@ class Strategy:
             self._set_state(State.SCANNING)
             self.log.sequence_detected(direction, candles, self.token_ids.get("market_ticker", ""))
 
-            # --- IMMEDATE ACTION: To reduce 2s delay ---
-            # Instead of waiting for next tick, attempt entry NOW
-            self._try_first_entry(0.0)
+            # --- IMMEDIATELY ACTION WITH ACCURATE ELAPSED TIME ---
+            # Replaces old '0.0' fix which bypassed windows on historical preloads.
+            now = synced_time()
+            # Last closed candle's close_time is effectively the start of current window
+            elapsed = now - (candles[-1].close_time / 1000.0)
+            
+            # Block historical or severely lagged sequences immediately
+            if elapsed > ENTRY_WINDOW_SECONDS:
+                 self.log.timeout(f"Sequence too old ({elapsed:.1f}s). Rejecting historical entry attempt.")
+                 self._set_state(State.IDLE)
+                 self._reset_context()
+                 return
+
+            # Instead of waiting for next tick, attempt entry NOW with real elapsed duration
+            self._try_first_entry(elapsed)
 
     def on_candle_tick(self, candle):
         """
@@ -298,7 +319,9 @@ class Strategy:
 
             # If we transitioned to WAIT, try Gale immediately
             if self._state == State.MARTINGALE_WAIT:
-                self._try_gale(0.0)
+                # Use absolute true elapsed diff for safety instead of 0.0
+                safe_elapsed = max(0.0, synced_time() - (self.martingale_start or synced_time()))
+                self._try_gale(safe_elapsed)
 
         # --- MOVED OUTSIDE LOCK: Network-bound call ---
         # ALWAYS update tokens on closing — each 5min cycle has new IDs
@@ -314,6 +337,9 @@ class Strategy:
 
     def _try_first_entry(self, elapsed: float):
         price = self.poly.get_ask_price(self.target_token_id)
+        # Sync the rate limiter to prevent redundant immediate ticks
+        self._last_price_check = synced_time()
+        
         bid   = self.poly.get_bid_price(self.target_token_id)
         self.log.price_check(self.target_side, price, elapsed, ENTRY_WINDOW_SECONDS, bid=bid)
 

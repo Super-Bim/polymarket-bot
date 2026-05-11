@@ -27,7 +27,7 @@ CHAIN_ID        = 137          # Polygon mainnet
 #   ACTIVE_MARKETS = ["BTC", "ETH"]        # BTC and ETH
 #   ACTIVE_MARKETS = "ALL"                 # All confirmed markets
 # =============================================================
-ACTIVE_MARKETS = "ALL"       # <-- EDIT THIS to choose your markets
+ACTIVE_MARKETS = "ALL"   # <-- EDIT THIS to choose your markets
 
 # Market definitions: slug, series_id (confirmed via Polymarket API), Binance symbol & stream
 MARKETS = {
@@ -96,13 +96,13 @@ def get_active_markets() -> list:
 
 # --- Strategy ---
 SEQUENCE_LENGTH          = 2
-ENTRY_PRICE_THRESHOLD    = 0.45
+ENTRY_PRICE_THRESHOLD    = 0.25
 GALE_1_PRICE_THRESHOLD   = 0.6
 GALE_2_PLUS_PRICE_THRESHOLD = 0.6 
-ENTRY_WINDOW_SECONDS     = 120
+ENTRY_WINDOW_SECONDS     = 90
 MARTINGALE_WINDOW_SECONDS= 180
 MARTINGALE_MULTIPLIER    = 2.75
-MAX_GALES                = 9
+MAX_GALES                = 1
 PROFIT_TARGET_PERCENT    = 150
 
 # --- Idle Mode (Post-Martingale) ---
@@ -111,9 +111,43 @@ PROFIT_TARGET_PERCENT    = 150
 IDLE_AFTER_GALE_LIMIT    = True    # Wait for trend reset after a full martingale loss?
 
 # --- Risk Management ---
-STOP_LOSS_PERCENT        = 50    # Stop loss per position
-INDECISION_EXIT_WINDOW_S = 9    # Seconds before close to exit if price is indecisive
+STOP_LOSS_PERCENT        = 40    # Stop loss per position
+INDECISION_EXIT_WINDOW_S = 7    # Seconds before close to exit if price is indecisive
 INDECISION_PRICE_RANGE   = (0.48, 0.53) # Price range considered "indecisive"
+
+# --- Technical Filters (Filters sequence detection) ---
+# Enabled filters MUST converge in the entry direction before the bot fires.
+FILTER_ENABLE_EMA        = False # EMA Filter (e.g., confirms long term trend)
+FILTER_EMA_PERIOD_SHORT  = 9
+FILTER_EMA_PERIOD_LONG   = 21
+
+FILTER_ENABLE_RSI        = False  # RSI Filter (Overbought/Oversold)
+FILTER_RSI_PERIOD        = 14
+FILTER_RSI_OVERBOUGHT    = 70     # Sell signal condition
+FILTER_RSI_OVERSOLD      = 30     # Buy signal condition
+
+FILTER_ENABLE_MACD       = True # MACD Filter (Momentum confirmation)
+FILTER_MACD_FAST         = 24
+FILTER_MACD_SLOW         = 52
+FILTER_MACD_SIGNAL       = 18
+
+FILTER_ENABLE_BBANDS     = False # Bollinger Bands Filter
+FILTER_BB_PERIOD         = 20
+FILTER_BB_STDDEV         = 2.0
+
+FILTER_ENABLE_FIBO       = False # Fibonacci Retracement Filter
+FILTER_FIBO_LOOKBACK     = 24    # Number of periods to find high/low for levels
+FILTER_FIBO_LEVEL        = 0.618 # Required breakout level (0.50 = 50%, 0.618 = 61.8%)
+
+def any_filters_active() -> bool:
+    """Returns True if at least one technical indicator filter is enabled."""
+    return any([
+        FILTER_ENABLE_EMA,
+        FILTER_ENABLE_RSI,
+        FILTER_ENABLE_MACD,
+        FILTER_ENABLE_BBANDS,
+        FILTER_ENABLE_FIBO
+    ])
 
 # --- Sizing ---
 BASE_TRADE_SIZE_USDC     = 1     # Base trade size ($1 minimum)
