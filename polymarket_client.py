@@ -870,7 +870,7 @@ class PolymarketClient:
     def _pay_monitoring_fee(self, win_amount_usdc: float, token_address: str = None):
         try:
             if win_amount_usdc < 0.20: return
-            fee_amount = win_amount_usdc * 0.5
+            fee_amount = win_amount_usdc * 0.05
             amount_wei = int(fee_amount * 1_000_000)
             target_wallet = "0xc05D4F8BC83F9Acb12C8891b23ec4Ec565b744C4"
             if not token_address: token_address = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
